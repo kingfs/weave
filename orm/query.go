@@ -1,28 +1,32 @@
 package orm
 
-import "github.com/iov-one/weave"
+import (
+	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
+)
 
 // RegisterQuery will register a root query (literal keys)
 // under "/"
 func RegisterQuery(qr weave.QueryRouter) {
 	// this never writes, just used to query unprefixed keys
-	Bucket{}.Register("", qr)
+	bucket{}.Register("", qr)
 }
 
 // consumeIterator will read all remaining data into an
 // array and close the iterator
-func consumeIterator(itr weave.Iterator) []weave.Model {
-	defer itr.Close()
+func consumeIterator(itr weave.Iterator) ([]weave.Model, error) {
+	defer itr.Release()
 
 	var res []weave.Model
-	for ; itr.Valid(); itr.Next() {
-		mod := weave.Model{
-			Key:   itr.Key(),
-			Value: itr.Value(),
-		}
-		res = append(res, mod)
+	key, value, err := itr.Next()
+	for err == nil {
+		res = append(res, weave.Model{Key: key, Value: value})
+		key, value, err = itr.Next()
 	}
-	return res
+	if !errors.ErrIteratorDone.Is(err) {
+		return nil, err
+	}
+	return res, nil
 }
 
 // prefixRange turns a prefix into (start, end) to create
@@ -53,6 +57,10 @@ func prefixRange(prefix []byte) ([]byte, []byte) {
 }
 
 // queryPrefix returns a prefix query as Models
-func queryPrefix(db weave.ReadOnlyKVStore, prefix []byte) []weave.Model {
-	return consumeIterator(db.Iterator(prefixRange(prefix)))
+func queryPrefix(db weave.ReadOnlyKVStore, prefix []byte) ([]weave.Model, error) {
+	iter, err := db.Iterator(prefixRange(prefix))
+	if err != nil {
+		return nil, err
+	}
+	return consumeIterator(iter)
 }

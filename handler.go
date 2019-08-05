@@ -2,6 +2,8 @@ package weave
 
 import (
 	"encoding/json"
+
+	abci "github.com/tendermint/tendermint/abci/types"
 )
 
 // Handler is a core engine that can process a few specific messages
@@ -15,33 +17,31 @@ type Handler interface {
 // It is its own interface to allow better type controls in the next
 // arguments in Decorator
 type Checker interface {
-	Check(ctx Context, store KVStore, tx Tx) (CheckResult, error)
+	Check(ctx Context, store KVStore, tx Tx) (*CheckResult, error)
 }
 
 // Deliverer is a subset of Handler to execute a transaction.
 // It is its own interface to allow better type controls in the next
 // arguments in Decorator
 type Deliverer interface {
-	Deliver(ctx Context, store KVStore, tx Tx) (DeliverResult, error)
+	Deliver(ctx Context, store KVStore, tx Tx) (*DeliverResult, error)
 }
 
 // Decorator wraps a Handler to provide common functionality
 // like authentication, or fee-handling, to many Handlers
 type Decorator interface {
-	Check(ctx Context, store KVStore, tx Tx, next Checker) (CheckResult, error)
-	Deliver(ctx Context, store KVStore, tx Tx, next Deliverer) (DeliverResult, error)
-}
-
-// Ticker is a method that is called the beginning of every block,
-// which can be used to perform periodic or delayed tasks
-type Ticker interface {
-	Tick(ctx Context, store KVStore) (TickResult, error)
+	Check(ctx Context, store KVStore, tx Tx, next Checker) (*CheckResult, error)
+	Deliver(ctx Context, store KVStore, tx Tx, next Deliverer) (*DeliverResult, error)
 }
 
 // Registry is an interface to register your handler,
 // the setup side of a Router
 type Registry interface {
-	Handle(path string, h Handler)
+	// Handle assigns given handler to handle processing of every message
+	// of provided type.
+	// Using a message with an invalid path panics.
+	// Registering a handler for a message more than ones panics.
+	Handle(Msg, Handler)
 }
 
 // Options are the app options
@@ -60,8 +60,22 @@ func (o Options) ReadOptions(key string, obj interface{}) error {
 	return json.Unmarshal(msg, obj)
 }
 
+// GenesisParams represents parameters set in genesis that could be useful
+// for some of the extensions.
+type GenesisParams struct {
+	Validators []abci.ValidatorUpdate
+}
+
+// FromInitChain initialises GenesisParams using abci.RequestInitChain
+// data.
+func FromInitChain(req abci.RequestInitChain) GenesisParams {
+	return GenesisParams{
+		Validators: req.Validators,
+	}
+}
+
 // Initializer implementations are used to initialize
 // extensions from genesis file contents
 type Initializer interface {
-	FromGenesis(Options, KVStore) error
+	FromGenesis(opts Options, params GenesisParams, kv KVStore) error
 }

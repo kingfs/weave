@@ -2,8 +2,9 @@ package iavl
 
 import (
 	"github.com/tendermint/iavl"
-	dbm "github.com/tendermint/tmlibs/db"
+	dbm "github.com/tendermint/tendermint/libs/db"
 
+	"github.com/iov-one/weave/errors"
 	"github.com/iov-one/weave/store"
 )
 
@@ -15,7 +16,7 @@ const (
 
 // CommitStore manages a iavl committed state
 type CommitStore struct {
-	tree       *iavl.VersionedTree
+	tree       *iavl.MutableTree
 	numHistory int64
 }
 
@@ -30,29 +31,44 @@ func NewCommitStore(path, name string) CommitStore {
 		panic(err)
 	}
 
-	tree := iavl.NewVersionedTree(db, DefaultCacheSize)
+	tree := iavl.NewMutableTree(db, DefaultCacheSize)
 	commit := CommitStore{tree, DefaultHistory}
-	commit.LoadLatestVersion()
+
+	err = commit.LoadLatestVersion()
+	if err != nil {
+		panic(err)
+	}
+
 	return commit
+}
+
+// NewCommitStoreFromTree accepts a preloaded MutableTree and wraps it
+// Mainly designed for test code... or devs who want full control
+func NewCommitStoreFromTree(tree *iavl.MutableTree) CommitStore {
+	return CommitStore{tree, DefaultHistory}
 }
 
 // MockCommitStore creates a new in-memory store for testing
 func MockCommitStore() CommitStore {
 	var db dbm.DB = dbm.NewMemDB()
-	tree := iavl.NewVersionedTree(db, DefaultCacheSize)
+	tree := iavl.NewMutableTree(db, DefaultCacheSize)
 	return CommitStore{tree, DefaultHistory}
 }
 
 // Get returns the value at last committed state
-// returns nil iff key doesn't exist. Panics on nil key.
-func (s CommitStore) Get(key []byte) []byte {
+// Returns nil iff key doesn't exist.
+// Returns error on nil key.
+func (s CommitStore) Get(key []byte) ([]byte, error) {
+	if len(key) == 0 {
+		return nil, errors.Wrap(errors.ErrDatabase, "nil key")
+	}
 	version := int64(s.tree.Version())
 	_, val := s.tree.GetVersioned(key, version)
-	return val
+	return val, nil
 }
 
 // Commit the next version to disk, and returns info
-func (s CommitStore) Commit() store.CommitID {
+func (s CommitStore) Commit() (store.CommitID, error) {
 	hash, version, err := s.tree.SaveVersion()
 	if err != nil {
 		panic(err)
@@ -61,13 +77,17 @@ func (s CommitStore) Commit() store.CommitID {
 	// Potentially release an old version of history
 	if s.numHistory > 0 && (s.numHistory < version) {
 		toRelease := version - s.numHistory
-		s.tree.DeleteVersion(toRelease)
+		err = s.tree.DeleteVersion(toRelease)
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	return store.CommitID{
+	c := store.CommitID{
 		Version: int64(version),
 		Hash:    hash,
 	}
+	return c, nil
 }
 
 // LoadLatestVersion loads the latest persisted version.
@@ -78,12 +98,22 @@ func (s CommitStore) LoadLatestVersion() error {
 	return err
 }
 
+// LoadVersion loads a specific persisted version.  When you load an old version, or
+// when the last commit attempt didn't complete, the next commit after
+// loading must be idempotent (return the same commit id).  Otherwise the
+// behavior is undefined.
+func (s CommitStore) LoadVersion(version int64) error {
+	_, err := s.tree.LoadVersion(version)
+	return err
+}
+
 // LatestVersion returns info on the latest version saved to disk
-func (s CommitStore) LatestVersion() store.CommitID {
-	return store.CommitID{
+func (s CommitStore) LatestVersion() (store.CommitID, error) {
+	c := store.CommitID{
 		Version: int64(s.tree.Version()),
 		Hash:    s.tree.Hash(),
 	}
+	return c, nil
 }
 
 // Adapter returns a wrapped version of the tree.
@@ -93,8 +123,8 @@ func (s CommitStore) LatestVersion() store.CommitID {
 // to rollback writes here, without throwing away the CommitStore
 // and re-loading from disk.
 func (s CommitStore) Adapter() store.CacheableKVStore {
-	var kv store.KVStore = adapter{s.tree.Tree()}
-	return store.BTreeCacheable{kv}
+	var kv store.KVStore = adapter{tree: s.tree}
+	return store.BTreeCacheable{KVStore: kv}
 }
 
 // CacheWrap wraps the Adapter with a cache, so it may be written
@@ -111,30 +141,32 @@ func (s CommitStore) CacheWrap() store.KVCacheWrap {
 
 // adapter converts the working iavl.Tree to match these interfaces
 type adapter struct {
-	tree *iavl.Tree
+	tree *iavl.MutableTree
 }
 
 var _ store.KVStore = adapter{}
 
 // Get returns nil iff key doesn't exist. Panics on nil key.
-func (a adapter) Get(key []byte) []byte {
+func (a adapter) Get(key []byte) ([]byte, error) {
 	_, val := a.tree.Get(key)
-	return val
+	return val, nil
 }
 
 // Has checks if a key exists. Panics on nil key.
-func (a adapter) Has(key []byte) bool {
-	return a.tree.Has(key)
+func (a adapter) Has(key []byte) (bool, error) {
+	return a.tree.Has(key), nil
 }
 
 // Set adds a new value
-func (a adapter) Set(key, value []byte) {
+func (a adapter) Set(key, value []byte) error {
 	a.tree.Set(key, value)
+	return nil
 }
 
 // Delete removes from the tree
-func (a adapter) Delete(key []byte) {
+func (a adapter) Delete(key []byte) error {
 	a.tree.Remove(key)
+	return nil
 }
 
 // NewBatch returns a batch that can write multiple ops atomically
@@ -145,27 +177,25 @@ func (a adapter) NewBatch() store.Batch {
 // Iterator over a domain of keys in ascending order. End is exclusive.
 // Start must be less than end, or the Iterator is invalid.
 // CONTRACT: No writes may happen within a domain while an iterator exists over it.
-func (a adapter) Iterator(start, end []byte) store.Iterator {
-	var res []store.Model
-	add := func(key []byte, value []byte) bool {
-		m := store.Model{Key: key, Value: value}
-		res = append(res, m)
-		return false
-	}
-	a.tree.IterateRange(start, end, true, add)
-	return store.NewSliceIterator(res)
+func (a adapter) Iterator(start, end []byte) (store.Iterator, error) {
+	iter := newLazyIterator()
+	go func() {
+		a.tree.IterateRange(start, end, true, iter.add)
+		iter.Release()
+	}()
+
+	return iter, nil
 }
 
 // ReverseIterator over a domain of keys in descending order. End is exclusive.
 // Start must be greater than end, or the Iterator is invalid.
 // CONTRACT: No writes may happen within a domain while an iterator exists over it.
-func (a adapter) ReverseIterator(start, end []byte) store.Iterator {
-	var res []store.Model
-	add := func(key []byte, value []byte) bool {
-		m := store.Model{Key: key, Value: value}
-		res = append(res, m)
-		return false
-	}
-	a.tree.IterateRange(start, end, false, add)
-	return store.NewSliceIterator(res)
+func (a adapter) ReverseIterator(start, end []byte) (store.Iterator, error) {
+	iter := newLazyIterator()
+	go func() {
+		a.tree.IterateRange(start, end, false, iter.add)
+		iter.Release()
+	}()
+
+	return iter, nil
 }

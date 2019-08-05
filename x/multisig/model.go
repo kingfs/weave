@@ -1,71 +1,76 @@
 package multisig
 
 import (
-	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/orm"
 )
 
+func init() {
+	migration.MustRegister(1, &Contract{}, migration.NoModification)
+}
+
 const (
-	// BucketName is where we store the contracts
-	BucketName = "contracts"
-	// SequenceName is an auto-increment ID counter for contracts
-	SequenceName = "id"
+	// Maximum value a weight value can be set to. This is uint8 capacity
+	// but because we use protobuf for serialization, weight is represented
+	// by uint32 and we must manually force the limit.
+	maxWeightValue = 255
 )
 
-// enforce that Contract fulfils desired interface compile-time
-var _ orm.CloneableData = (*Contract)(nil)
+// Weight represents the strength of a signature.
+type Weight int32
 
-// Validate enforces sigs and threshold boundaries
-func (c *Contract) Validate() error {
-	if len(c.Sigs) == 0 {
-		return ErrMissingSigs()
+func (w Weight) Validate() error {
+	if w < 1 {
+		return errors.Wrap(errors.ErrState,
+			"weight must be greater than 0")
 	}
-	if c.ActivationThreshold <= 0 || int(c.ActivationThreshold) > len(c.Sigs) {
-		return ErrInvalidActivationThreshold()
-	}
-	if c.AdminThreshold <= 0 {
-		return ErrInvalidChangeThreshold()
-	}
-	for _, a := range c.Sigs {
-		if err := weave.Address(a).Validate(); err != nil {
-			return err
-		}
+	if w > maxWeightValue {
+		return errors.Wrapf(errors.ErrOverflow,
+			"weight is %d and must not be greater than %d", w, maxWeightValue)
 	}
 	return nil
 }
 
-// Copy makes a new Profile with the same data
+var _ orm.CloneableData = (*Contract)(nil)
+
+func (c *Contract) Validate() error {
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", c.Metadata.Validate())
+	switch n := len(c.Participants); {
+	case n == 0:
+		errs = errors.Append(errs, errors.Field("Participants", errors.ErrModel, "no participants"))
+	case n > maxParticipantsAllowed:
+		errs = errors.Append(errs, errors.Field("Participants", errors.ErrModel, "too many participants, max %d allowed", maxParticipantsAllowed))
+	}
+	errs = errors.AppendField(errs, "Address", c.Address.Validate())
+	errs = errors.Append(errs, validateWeights(errors.ErrModel, c.Participants, c.ActivationThreshold, c.AdminThreshold))
+
+	return errs
+}
+
 func (c *Contract) Copy() orm.CloneableData {
+	ps := make([]*Participant, 0, len(c.Participants))
+	for _, p := range c.Participants {
+		ps = append(ps, &Participant{
+			Signature: p.Signature.Clone(),
+			Weight:    p.Weight,
+		})
+	}
 	return &Contract{
-		Sigs:                c.Sigs,
+		Metadata:            c.Metadata.Copy(),
+		Participants:        ps,
 		ActivationThreshold: c.ActivationThreshold,
 		AdminThreshold:      c.AdminThreshold,
+		Address:             c.Address.Clone(),
 	}
 }
 
-// ContractBucket is a type-safe wrapper around orm.Bucket
-type ContractBucket struct {
-	orm.Bucket
-	idSeq orm.Sequence
+func NewContractBucket() orm.ModelBucket {
+	b := orm.NewModelBucket("contracts", &Contract{},
+		orm.WithIDSequence(contractSeq),
+	)
+	return migration.NewModelBucket("multisig", b)
 }
 
-// NewContractBucket initializes a ContractBucket with default name
-//
-// inherit Get and Save from orm.Bucket
-// add run-time check on Save
-func NewContractBucket() ContractBucket {
-	bucket := orm.NewBucket(BucketName,
-		orm.NewSimpleObj(nil, new(Contract)))
-	return ContractBucket{
-		Bucket: bucket,
-		idSeq:  bucket.Sequence(SequenceName),
-	}
-}
-
-// Save enforces the proper type
-func (b ContractBucket) Save(db weave.KVStore, obj orm.Object) error {
-	if _, ok := obj.Value().(*Contract); !ok {
-		return orm.ErrInvalidObject(obj.Value())
-	}
-	return b.Bucket.Save(db, obj)
-}
+var contractSeq = orm.NewSequence("contracts", "id")

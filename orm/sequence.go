@@ -6,8 +6,6 @@ import (
 	"github.com/iov-one/weave"
 )
 
-var seqPrefix = []byte("_s.")
-
 // Sequence maintains a counter, and generates a
 // series of keys. Each key is greater than the last,
 // both NextInt() as well as bytes.Compare() on NextVal().
@@ -15,41 +13,41 @@ type Sequence struct {
 	id []byte
 }
 
-// NewSequence creates a sequence with this id
-// Form _s.<bucket>:<name>
-// KeyTagger uses _s.<bucket> as key
+// NewSequence returns a sequence counter. Sequence is using following pattern
+// to construct a key:
+//    _s.<bucket>:<name>
 func NewSequence(bucket, name string) Sequence {
-	suffix := bucket + ":" + name
+	id := "_s." + bucket + ":" + name
 	return Sequence{
-		id: append(seqPrefix, suffix...),
+		id: []byte(id),
 	}
 }
 
-// NextVal increments the sequence and returns next val as 8 bytes
-func (s *Sequence) NextVal(db weave.KVStore) []byte {
-	_, bz := s.increment(db)
-	return bz
+// NextVal increments the sequence and returns its state as 8 bytes.
+func (s *Sequence) NextVal(db weave.KVStore) ([]byte, error) {
+	_, bz, err := s.increment(db, 1)
+	return bz, err
 }
 
-// NextInt increments the sequence and returns next val as int
-func (s *Sequence) NextInt(db weave.KVStore) int64 {
-	val, _ := s.increment(db)
-	return val
+// NextInt increments the sequence and returns its state as int.
+func (s *Sequence) NextInt(db weave.KVStore) (int64, error) {
+	val, _, err := s.increment(db, 1)
+	return val, err
 }
 
-func (s *Sequence) curVal(db weave.KVStore) (key, val []byte) {
-	key = append(seqPrefix, s.id...)
-	val = db.Get(key)
-	return key, val
-}
-
-func (s *Sequence) increment(db weave.KVStore) (int64, []byte) {
-	key, bz := s.curVal(db)
-	val := decodeSequence(bz)
-	val++
-	bz = encodeSequence(val)
-	db.Set(key, bz)
-	return val, bz
+func (s *Sequence) increment(db weave.KVStore, inc int64) (int64, []byte, error) {
+	raw, err := db.Get(s.id)
+	if err != nil {
+		return 0, nil, err
+	}
+	val := decodeSequence(raw)
+	if inc == 0 {
+		return val, raw, nil
+	}
+	val += inc
+	raw = encodeSequence(val)
+	err = db.Set(s.id, raw)
+	return val, raw, err
 }
 
 func decodeSequence(bz []byte) int64 {

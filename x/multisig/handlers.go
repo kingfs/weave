@@ -3,6 +3,7 @@ package multisig
 import (
 	"github.com/iov-one/weave"
 	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/orm"
 	"github.com/iov-one/weave/x"
 )
@@ -10,9 +11,10 @@ import (
 // RegisterRoutes will instantiate and register
 // all handlers in this package
 func RegisterRoutes(r weave.Registry, auth x.Authenticator) {
+	r = migration.SchemaMigratingRegistry("multisig", r)
 	bucket := NewContractBucket()
-	r.Handle(pathCreateContractMsg, CreateContractMsgHandler{auth, bucket})
-	r.Handle(pathUpdateContractMsg, UpdateContractMsgHandler{auth, bucket})
+	r.Handle(&CreateMsg{}, CreateMsgHandler{auth, bucket})
+	r.Handle(&UpdateMsg{}, UpdateMsgHandler{auth, bucket})
 }
 
 // RegisterQuery register queries from buckets in this package
@@ -20,152 +22,121 @@ func RegisterQuery(qr weave.QueryRouter) {
 	NewContractBucket().Register("contracts", qr)
 }
 
-type CreateContractMsgHandler struct {
+type CreateMsgHandler struct {
 	auth   x.Authenticator
-	bucket ContractBucket
+	bucket orm.ModelBucket
 }
 
-var _ weave.Handler = CreateContractMsgHandler{}
+var _ weave.Handler = CreateMsgHandler{}
 
-func (h CreateContractMsgHandler) Check(ctx weave.Context, db weave.KVStore, tx weave.Tx) (weave.CheckResult, error) {
-	var res weave.CheckResult
+func (h CreateMsgHandler) Check(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*weave.CheckResult, error) {
 	_, err := h.validate(ctx, db, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 
-	res.GasAllocated = creationCost
-	return res, nil
+	return &weave.CheckResult{GasAllocated: creationCost}, nil
 }
 
-func (h CreateContractMsgHandler) Deliver(ctx weave.Context, db weave.KVStore, tx weave.Tx) (weave.DeliverResult, error) {
-	var res weave.DeliverResult
+func (h CreateMsgHandler) Deliver(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*weave.DeliverResult, error) {
 	msg, err := h.validate(ctx, db, tx)
 	if err != nil {
-		return res, err
+		return nil, err
+	}
+
+	key, err := contractSeq.NextVal(db)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot acquire ID")
 	}
 
 	contract := &Contract{
-		Sigs:                msg.Sigs,
+		Metadata:            &weave.Metadata{Schema: 1},
+		Participants:        msg.Participants,
 		ActivationThreshold: msg.ActivationThreshold,
 		AdminThreshold:      msg.AdminThreshold,
+		Address:             MultiSigCondition(key).Address(),
 	}
 
-	id := h.bucket.idSeq.NextVal(db)
-	obj := orm.NewSimpleObj(id, contract)
-	err = h.bucket.Save(db, obj)
-	if err != nil {
-		return res, err
+	if _, err = h.bucket.Put(db, key, contract); err != nil {
+		return nil, errors.Wrap(err, "cannot save contract")
 	}
-
-	res.Data = id
-	return res, nil
+	return &weave.DeliverResult{Data: key}, nil
 }
 
-// validate does all common pre-processing between Check and Deliver
-func (h CreateContractMsgHandler) validate(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*CreateContractMsg, error) {
-	// Retrieve tx main signer in this context
+// validate does all common pre-processing between Check and Deliver.
+func (h CreateMsgHandler) validate(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*CreateMsg, error) {
+	// Retrieve tx main signer in this context.
 	sender := x.MainSigner(ctx, h.auth)
 	if sender == nil {
-		return nil, errors.ErrUnauthorized()
+		return nil, errors.Wrap(errors.ErrUnauthorized, "no signer")
 	}
 
-	msg, err := tx.GetMsg()
-	if err != nil {
-		return nil, err
+	var msg CreateMsg
+	if err := weave.LoadMsg(tx, &msg); err != nil {
+		return nil, errors.Wrap(err, "load msg")
 	}
 
-	createContractMsg, ok := msg.(*CreateContractMsg)
-	if !ok {
-		return nil, errors.ErrUnknownTxType(msg)
-	}
-
-	err = createContractMsg.Validate()
-	if err != nil {
-		return nil, err
-	}
-
-	return createContractMsg, nil
+	return &msg, nil
 }
 
-type UpdateContractMsgHandler struct {
+type UpdateMsgHandler struct {
 	auth   x.Authenticator
-	bucket ContractBucket
+	bucket orm.ModelBucket
 }
 
-var _ weave.Handler = CreateContractMsgHandler{}
+var _ weave.Handler = CreateMsgHandler{}
 
-func (h UpdateContractMsgHandler) Check(ctx weave.Context, db weave.KVStore, tx weave.Tx) (weave.CheckResult, error) {
-	var res weave.CheckResult
+func (h UpdateMsgHandler) Check(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*weave.CheckResult, error) {
 	_, err := h.validate(ctx, db, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
-
-	res.GasAllocated = updateCost
-	return res, nil
+	return &weave.CheckResult{GasAllocated: updateCost}, nil
 }
 
-func (h UpdateContractMsgHandler) Deliver(ctx weave.Context, db weave.KVStore, tx weave.Tx) (weave.DeliverResult, error) {
-	var res weave.DeliverResult
+func (h UpdateMsgHandler) Deliver(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*weave.DeliverResult, error) {
 	msg, err := h.validate(ctx, db, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 
 	contract := &Contract{
-		Sigs:                msg.Sigs,
+		Metadata:            &weave.Metadata{Schema: 1},
+		Participants:        msg.Participants,
 		ActivationThreshold: msg.ActivationThreshold,
 		AdminThreshold:      msg.AdminThreshold,
+		Address:             MultiSigCondition(msg.ContractID).Address(),
 	}
 
-	obj := orm.NewSimpleObj(msg.Id, contract)
-	err = h.bucket.Save(db, obj)
-	if err != nil {
-		return res, err
+	if _, err := h.bucket.Put(db, msg.ContractID, contract); err != nil {
+		return nil, errors.Wrap(err, "cannot update contract")
 	}
 
-	return res, nil
+	return &weave.DeliverResult{}, nil
 }
 
-// validate does all common pre-processing between Check and Deliver
-func (h UpdateContractMsgHandler) validate(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*UpdateContractMsg, error) {
-	msg, err := tx.GetMsg()
-	if err != nil {
-		return nil, err
+func (h UpdateMsgHandler) validate(ctx weave.Context, db weave.KVStore, tx weave.Tx) (*UpdateMsg, error) {
+	var msg UpdateMsg
+	if err := weave.LoadMsg(tx, &msg); err != nil {
+		return nil, errors.Wrap(err, "load msg")
 	}
 
-	updateContractMsg, ok := msg.(*UpdateContractMsg)
-	if !ok {
-		return nil, errors.ErrUnknownTxType(msg)
+	// Using current version of the contract, ensure that enoguht
+	// participants with enough weight signed this transaction in
+	// order to run functionality that requires admin rights.
+	var contract Contract
+	if err := h.bucket.One(db, msg.ContractID, &contract); err != nil {
+		return nil, errors.Wrap(err, "cannot load contract from the store")
 	}
-
-	err = updateContractMsg.Validate()
-	if err != nil {
-		return nil, err
+	var weight Weight
+	for _, p := range contract.Participants {
+		if h.auth.HasAddress(ctx, p.Signature) {
+			weight += p.Weight
+		}
 	}
-
-	// load contract
-	obj, err := h.bucket.Get(db, updateContractMsg.Id)
-	if err != nil {
-		return nil, err
+	if weight < contract.AdminThreshold {
+		return &msg, errors.Wrapf(errors.ErrUnauthorized,
+			"%d weight is not enough to administrate %q", weight, msg.ContractID)
 	}
-	if obj == nil || (obj != nil && obj.Value() == nil) {
-		return nil, ErrContractNotFound(updateContractMsg.Id)
-	}
-	contract := obj.Value().(*Contract)
-
-	// retrieve sigs
-	var sigs []weave.Address
-	for _, sig := range contract.Sigs {
-		sigs = append(sigs, sig)
-	}
-
-	// check sigs
-	authenticated := x.HasNAddresses(ctx, h.auth, sigs, int(contract.AdminThreshold))
-	if !authenticated {
-		return nil, ErrUnauthorizedMultiSig(updateContractMsg.Id)
-	}
-
-	return updateContractMsg, nil
+	return &msg, nil
 }

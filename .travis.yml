@@ -10,54 +10,70 @@ addons:
     packages:
     - docker-ce
 
+cache:
+  directories:
+    - $HOME/.cache/go-build
+    - $HOME/gopath/pkg/mod
+
 os:
 - linux
 
 go:
-- "1.10"
-- tip
+# reason for bumping 1.11.x to 1.11.4+ is this: https://github.com/golang/go/issues/30446#issuecomment-468038052
+- "1.11.4"
+- "1.12"
+
 
 env:
-- GORACE="halt_on_error=1"
-  BUILD_VERSION=$(echo ${TRAVIS_COMMIT} | cut -c 1-10)
-  TM_VERSION=v0.21.0
+  global:
+    - TM_VERSION=v0.31.5
+    - BUILD_VERSION=$(echo ${TRAVIS_COMMIT} | cut -c 1-10)
+    - MAIN_GO_VERSION=1.12
+    - GORACE="halt_on_error=1"
+    - FORCE_TM_TEST=1
 
 install:
-- make deps
 - go get -d github.com/tendermint/tendermint/... ;
   cd ${GOPATH}/src/github.com/tendermint/tendermint ;
   git checkout ${TM_VERSION} ;
-  make ensure_deps && make install ;
-  cd - ;
-  rm -rf ${GOPATH}/src/github.com/tendermint/tendermint
+  make get_tools && make check && make install ;
+  cd -;
 
 script:
-- make build
-- make test
-- make dist
+- make protolint;
+- make protodocs;
+- make install;
+- make all;
+- if [[ "$TRAVIS_GO_VERSION" == "$MAIN_GO_VERSION" ]]; then
+     make cover;
+     ./coverage/upload.sh;
+   fi;
+- printenv | grep -Ev "PATH|path|GEM" > env.list
+- docker run -it --rm --env-file env.list -v "$(pwd):/usr/src/app" iov1ops/danger:latest > danger.out; cat danger.out
+- if [[ "$TRAVIS_GO_VERSION" == "$MAIN_GO_VERSION" && "$TRAVIS_OS_NAME" == "linux" ]]; then
+    release_latest=$( [[ "$TRAVIS_BRANCH" == "master" && "$TRAVIS_TAG" == "" && "$TRAVIS_PULL_REQUEST_BRANCH" == "" ]] && echo "yes" || echo "no" );
+    release_tag=$( [[ "$TRAVIS_TAG" != "" ]] && echo "yes" || echo "no" );
 
-after_script:
-- make cover
-- ./coverage/upload.sh
+    if [[ $release_latest == "yes" || $release_tag == "yes" ]]; then
+      make dist;
+    fi
 
-after_success:
-- if [[ "$TRAVIS_GO_VERSION" == "1.10" ]] && [[ "$TRAVIS_OS_NAME" == "linux" ]] && [[ "$TRAVIS_BRANCH" == "master" ]] && [[ "$TRAVIS_TAG" == "" ]] && [[ "$TRAVIS_PULL_REQUEST_BRANCH" == "" ]]; then
-  docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD";
-  docker tag  "iov1/bcpd:${BUILD_VERSION}" "iov1/bcpd:latest" ;
-  docker push "iov1/bcpd:latest";
-  docker tag  "iov1/bnsd:${BUILD_VERSION}" "iov1/bnsd:latest" ;
-  docker push "iov1/bnsd:latest";
-  docker logout;
-  fi
-# build the tagged image
-- if [[ "$TRAVIS_GO_VERSION" == "1.10" ]] && [[ "$TRAVIS_OS_NAME" == "linux" ]] && [[ "$TRAVIS_TAG" != "" ]]; then
-  docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD";
-  docker tag  "iov1/bcpd:${BUILD_VERSION}" "iov1/bcpd:$TRAVIS_TAG" ;
-  docker push "iov1/bcpd:$TRAVIS_TAG";
-  docker tag  "iov1/bnsd:${BUILD_VERSION}" "iov1/bnsd:$TRAVIS_TAG" ;
-  docker push "iov1/bnsd:$TRAVIS_TAG";
-  docker logout;
-  fi
+    if [[ $release_latest == "yes" ]]; then
+      docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD";
+      docker tag  "iov1/bnsd:${BUILD_VERSION}" "iov1/bnsd:latest" ;
+      docker push "iov1/bnsd:latest";
+      docker logout;
+    fi;
+
+    if [[ $release_tag == "yes" ]]; then
+      docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD";
+      docker tag  "iov1/bnsd:${BUILD_VERSION}" "iov1/bnsd:$TRAVIS_TAG" ;
+      docker push "iov1/bnsd:$TRAVIS_TAG";
+      docker logout;
+    fi;
+  fi;
+
+
 notifications:
   email: false
 
@@ -65,4 +81,5 @@ notifications:
 branches:
   only:
   - master
+  - launch
   - /^v[0-9]+\.[0-9]+\.[0-9]+$/

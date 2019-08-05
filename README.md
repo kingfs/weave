@@ -1,4 +1,4 @@
-# Iov Weave
+# IOV Weave
 [![Build Status TravisCI](https://api.travis-ci.com/iov-one/weave.svg?branch=master)](https://travis-ci.com/iov-one/weave)
 [![codecov](https://codecov.io/gh/iov-one/weave/branch/master/graph/badge.svg)](https://codecov.io/gh/iov-one/weave/branch/master)
 [![LoC](https://tokei.rs/b1/github/iov-one/weave)](https://github.com/iov-one/weave)
@@ -7,6 +7,8 @@
 )](https://godoc.org/github.com/iov-one/weave)
 [![ReadTheDocs](https://readthedocs.org/projects/weave/badge/?version=latest)](http://weave.readthedocs.io/en/latest/)
 [![license](https://img.shields.io/github/license/iov-one/weave.svg)](https://github.com/iov-one/weave/blob/master/LICENSE)
+
+![Weave Logo](./docs/_static/img/weave-logo.jpg)
 
 IOV Weave is a framework for quickly building your custom
 [ABCI application](https://github.com/tendermint/abci)
@@ -17,7 +19,10 @@ quickly be imported in your custom chain, as well as a
 simple framework for adding the custom functionality unique
 to your project.
 
-**Note: Requires Go 1.9+**
+Join the Weave [community channel](https://riot.im/app/#/room/#weave:matrix.org) :loudspeaker:
+
+
+**Note: Requires Go 1.11.4+**
 
 It is inspired by the routing and middleware model of many web
 application frameworks, and informed by years of wrestling with
@@ -44,12 +49,11 @@ defaults and best practices for many choices, while allowing
 extreme flexibility in business logic and data modelling.
 
 For more details on the design goals, see the
-[Design Document](./docs/design.rst)
+[Design Document](./docs/design/overview.rst)
 
 ## Prerequisites
 
-* [golang 1.9+](https://golang.org/doc/install)
-
+* [golang 1.11.4+](https://golang.org/doc/install)
 
 ## Instructions
 
@@ -59,19 +63,17 @@ If you have a solid go and node developer setup, you may skip this,
 but good to go through it to be sure.
 
 Once you are set up, you should be able to run something
-like the following to compile both `mycoind` (sample app)
-and `tendermint` (a [BFT consensus engine](https://tendermint.com)):
+like the following to compile both `bnsd` (IOV blockchain application)
+and `bnscli` (a client side app to interact with `bnsd`).
+You will have to
+[install a compatible version of tendermint](https://github.com/tendermint/tendermint/blob/master/docs/introduction/install.md)
+separately. (Currently we use the v0.31.5 release).
 
 ```
-go get github.com/iov-one/weave
-cd $GOPATH/src/github.com/iov-one/weave
-make deps
+# cd into to your workspace that is not in your $GOPATH
+git clone https://github.com/iov-one/weave.git
+cd weave
 make install
-# test it built properly
-tendermint version
-# 0.21.0-46369a1a
-mycoind version
-# v0.6.0-7-g3aa16c9
 ```
 
 Note that this app relies on a separate tendermint process
@@ -81,7 +83,55 @@ as well as the documentation on the
 [tendermint cli commands](https://tendermint.readthedocs.io/en/master/using-tendermint.html).
 
 Once it compiles, I highly suggest going through the
-[tutorials on readthedocs](https://weave.readthedocs.io/en/latest/index.html#mycoin-tutorial)
+[readthedocs](https://weave.readthedocs.io/en/latest)
+
+## Compatibility Charts
+
+| Weave | Tendermint |
+|--------|-----------|
+|v0.15.x | v0.31.5|
+|v0.14.x | v0.29.1|
+|v0.13.0 | v0.29.1|
+|v0.12.0 | v0.29.1|
+|v0.11.1 | v0.29.1|
+|v0.11.0 | v0.27.4|
+|v0.10.x | v0.27.4|
+|v0.9.3	| v0.25.0|
+
+| Weave | Protobuf compatible to previous version| Comments |
+|--------|--------------------|------------------|
+|v0.15.0 | :x:| See [CHANGELOG for 0.15.0](https://github.com/iov-one/weave/blob/master/CHANGELOG.md#0150) |
+|v0.14.0 | :x:| See [CHANGELOG for 0.14.0](https://github.com/iov-one/weave/blob/master/CHANGELOG.md#0140) |
+|v0.13.0 | :x:| Changes in `x/multisig` - signer weights added. |
+|v0.12.1 | :x:| Changes in `x/escrow` - wall clock timeout implemented. |
+|v0.12.0 | :x:| Currency no longer supports supplying SigFigs nor returns them. |
+|v0.11.1 | :heavy_check_mark:| |
+|v0.11.0 | :heavy_check_mark:| |
+|v0.10.2 | :heavy_check_mark:| |
+|v0.10.1 | :x:| |
+|v0.10.0 | :x:| |
+|v0.9.3	| :heavy_check_mark:| |
+
+## Protobuf Documentation
+
+We generate documentation from the *.proto files to keep it up to date.
+
+You can view the [documentation for all packages used in the `bns` app](http://htmlpreview.github.io/?https://github.com/iov-one/weave/blob/master/docs/proto/index.html).
+
+Or generate it yourself:
+
+```shell
+make prototools
+make protodocs
+open ./docs/proto/index.html
+```
+
+## Contributions
+
+When opening a pull request with a change that does not require a CHANGELOG
+entry, include `!nochangelog` in the description. This will inform our build
+system to not fail the build due to a missing CHANGELOG update. This
+instruction is needed only if you are changing any of the Go source files.
 
 ## History
 
@@ -99,3 +149,5 @@ that organization in August 2018 to be developed further
 for their BNS blockchain, as well as a companion to
 [iov-core](https://github.com/iov-one/iov-core)
 client libraries that deprecated `confio/weave-js`
+
+Thanks to [newfinal100](https://github.com/newfinal100) for designing the weave logo.

@@ -2,159 +2,147 @@ package escrow
 
 import (
 	"github.com/iov-one/weave"
-	"github.com/iov-one/weave/x"
-	"github.com/iov-one/weave/x/cash"
+	coin "github.com/iov-one/weave/coin"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 )
 
-const (
-	pathCreateEscrowMsg        = "escrow/create"
-	pathReleaseEscrowMsg       = "escrow/release"
-	pathReturnEscrowMsg        = "escrow/return"
-	pathUpdateEscrowPartiesMsg = "escrow/update"
+func init() {
+	migration.MustRegister(1, &CreateMsg{}, migration.NoModification)
+	migration.MustRegister(1, &ReleaseMsg{}, migration.NoModification)
+	migration.MustRegister(1, &ReturnMsg{}, migration.NoModification)
+	migration.MustRegister(1, &UpdatePartiesMsg{}, migration.NoModification)
+}
 
+const (
 	maxMemoSize int = 128
 )
 
-var _ weave.Msg = (*CreateEscrowMsg)(nil)
-var _ weave.Msg = (*ReleaseEscrowMsg)(nil)
-var _ weave.Msg = (*ReturnEscrowMsg)(nil)
-var _ weave.Msg = (*UpdateEscrowPartiesMsg)(nil)
-
-//--------- Path routing --------
-
-// Path fulfills weave.Msg interface to allow routing
-func (CreateEscrowMsg) Path() string {
-	return pathCreateEscrowMsg
-}
-
-// Path fulfills weave.Msg interface to allow routing
-func (ReleaseEscrowMsg) Path() string {
-	return pathReleaseEscrowMsg
-}
-
-// Path fulfills weave.Msg interface to allow routing
-func (ReturnEscrowMsg) Path() string {
-	return pathReturnEscrowMsg
-}
-
-// Path fulfills weave.Msg interface to allow routing
-func (UpdateEscrowPartiesMsg) Path() string {
-	return pathUpdateEscrowPartiesMsg
-}
-
-//--------- Validation --------
-
 // NewCreateMsg is a helper to quickly build a create escrow message
-func NewCreateMsg(send, rcpt weave.Address, arb weave.Condition,
-	amount x.Coins, timeout int64, memo string) *CreateEscrowMsg {
-	return &CreateEscrowMsg{
-		Sender:    send,
-		Recipient: rcpt,
-		Arbiter:   arb,
-		Amount:    amount,
-		Timeout:   timeout,
-		Memo:      memo,
+func NewCreateMsg(
+	source weave.Address,
+	recipient weave.Address,
+	arbiter weave.Address,
+	amount coin.Coins,
+	timeout weave.UnixTime,
+	memo string,
+) *CreateMsg {
+	return &CreateMsg{
+		Metadata:    &weave.Metadata{Schema: 1},
+		Source:      source,
+		Destination: recipient,
+		Arbiter:     arbiter,
+		Amount:      amount,
+		Timeout:     timeout,
+		Memo:        memo,
 	}
 }
 
+var _ weave.Msg = (*CreateMsg)(nil)
+
+func (CreateMsg) Path() string {
+	return "escrow/create"
+}
+
 // Validate makes sure that this is sensible
-func (m *CreateEscrowMsg) Validate() error {
-	if m.Arbiter == nil {
-		return ErrMissingArbiter()
+func (m *CreateMsg) Validate() error {
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	errs = errors.AppendField(errs, "Arbiter", m.Arbiter.Validate())
+	errs = errors.AppendField(errs, "Destination", m.Destination.Validate())
+	if m.Timeout == 0 {
+		// Zero timeout is a valid value that dates to 1970-01-01. We
+		// know that this value is in the past and makes no sense. Most
+		// likely value was not provided and a zero value remained.
+		errs = errors.Append(errs, errors.Field("Timeout", errors.ErrInput, "required"))
 	}
-	if m.Recipient == nil {
-		return ErrMissingRecipient()
-	}
-	if m.Timeout <= 0 {
-		return ErrInvalidTimeout(m.Timeout)
-	}
+	errs = errors.AppendField(errs, "Timeout", m.Timeout.Validate())
 	if len(m.Memo) > maxMemoSize {
-		return ErrInvalidMemo(m.Memo)
+		errs = errors.Append(errs, errors.Field("Memo", errors.ErrInput, "cannot be longer than %d", maxMemoSize))
 	}
-	if err := validateAmount(m.Amount); err != nil {
-		return err
-	}
-	if err := validateConditions(m.Arbiter); err != nil {
-		return err
-	}
-	return validateAddresses(m.Sender, m.Recipient)
+	errs = errors.AppendField(errs, "Amount", validateAmount(m.Amount))
+	return errs
+}
+
+var _ weave.Msg = (*ReleaseMsg)(nil)
+
+func (ReleaseMsg) Path() string {
+	return "escrow/release"
 }
 
 // Validate makes sure that this is sensible
-func (m *ReleaseEscrowMsg) Validate() error {
-	err := validateEscrowID(m.EscrowId)
-	if err != nil {
-		return err
+func (m *ReleaseMsg) Validate() error {
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	errs = errors.AppendField(errs, "EscrowID", validateEscrowID(m.EscrowId))
+	if m.Amount != nil {
+		errs = errors.AppendField(errs, "Amount", validateAmount(m.Amount))
 	}
-	if m.Amount == nil {
-		return nil
-	}
-	return validateAmount(m.Amount)
+	return errs
+}
+
+var _ weave.Msg = (*ReturnMsg)(nil)
+
+func (ReturnMsg) Path() string {
+	return "escrow/return"
 }
 
 // Validate always returns true for no data
-func (m *ReturnEscrowMsg) Validate() error {
-	return validateEscrowID(m.EscrowId)
+func (m *ReturnMsg) Validate() error {
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	errs = errors.AppendField(errs, "EscrowID", validateEscrowID(m.EscrowId))
+	return errs
+}
+
+var _ weave.Msg = (*UpdatePartiesMsg)(nil)
+
+func (UpdatePartiesMsg) Path() string {
+	return "escrow/update"
 }
 
 // Validate makes sure any included items are valid permissions
 // and there is at least one change
-func (m *UpdateEscrowPartiesMsg) Validate() error {
-	err := validateEscrowID(m.EscrowId)
-	if err != nil {
-		return err
+func (m *UpdatePartiesMsg) Validate() error {
+
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	errs = errors.AppendField(errs, "EscrowID", validateEscrowID(m.EscrowId))
+
+	// We allow for nil values because if the message does not have a field
+	// set, we do not overwrite the model with a new value. At least one
+	// field must be updated though.
+	if m.Arbiter == nil && m.Source == nil && m.Destination == nil {
+		errs = errors.Append(errs, errors.Wrap(errors.ErrEmpty, "all conditions"))
 	}
-	if m.Arbiter == nil &&
-		m.Sender == nil &&
-		m.Recipient == nil {
-		return ErrMissingAllConditions()
+	if m.Source != nil {
+		errs = errors.AppendField(errs, "Source", m.Source.Validate())
 	}
-	err = validateConditions(m.Arbiter)
-	if err != nil {
-		return err
+	if m.Destination != nil {
+		errs = errors.AppendField(errs, "Destination", m.Destination.Validate())
 	}
-	return validateAddresses(m.Sender, m.Recipient)
+	if m.Arbiter != nil {
+		errs = errors.AppendField(errs, "Arbiter", m.Arbiter.Validate())
+	}
+	return errs
 }
 
-// validateConditions returns an error if any permission doesn't validate
-// nil is considered valid here
-func validateConditions(perms ...weave.Condition) error {
-	for _, p := range perms {
-		if p != nil {
-			if err := p.Validate(); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// validateAddresses returns an error if any address doesn't validate
-// nil is considered valid here
-func validateAddresses(addrs ...weave.Address) error {
-	for _, a := range addrs {
-		if a != nil {
-			if err := a.Validate(); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func validateAmount(amount x.Coins) error {
+func validateAmount(amount coin.Coins) error {
 	// we enforce this is positive
 	positive := amount.IsPositive()
 	if !positive {
-		return cash.ErrInvalidAmount("Non-positive SendMsg")
+		return errors.Wrapf(errors.ErrAmount, "non-positive: %#v", &amount)
 	}
 	// then make sure these are properly formatted coins
 	return amount.Validate()
 }
 
 func validateEscrowID(id []byte) error {
-	if len(id) != 8 {
-		return ErrInvalidEscrowID(id)
+	switch n := len(id); {
+	case n > 8:
+		return errors.Wrap(errors.ErrInput, "too long")
+	case n < 8:
+		return errors.Wrap(errors.ErrInput, "too short")
 	}
 	return nil
 }

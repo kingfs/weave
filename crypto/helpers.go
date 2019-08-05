@@ -1,13 +1,15 @@
 package crypto
 
 import (
+	"errors"
+
 	"github.com/iov-one/weave"
 )
 
 // ExtensionName is used for the Conditions we get from signatures
 const ExtensionName = "sigs"
 
-// PubKey represents a crypto public key we use
+// Pubkey represents a crypto public key we use
 type PubKey interface {
 	Verify(message []byte, sig *Signature) bool
 	Condition() weave.Condition
@@ -23,7 +25,7 @@ type Signer interface {
 //-------- unwrappers --------
 // enforce that all of the one-ofs implement some interfaces
 
-// unwrap a PublicKey struct into a PubKey interface
+// unwrap a PublicKey struct into a Pubkey interface
 func (p PublicKey) unwrap() PubKey {
 	pub := p.GetPub()
 	if pub == nil {
@@ -47,6 +49,10 @@ var _ PubKey = (*PublicKey)(nil)
 
 // Verify verifies the signature was created with this message and public key
 func (p *PublicKey) Verify(message []byte, sig *Signature) bool {
+	// Absence of a public key is always failing the signature test.
+	if p.unwrap() == nil {
+		return false
+	}
 	return p.unwrap().Verify(message, sig)
 }
 
@@ -69,6 +75,9 @@ var _ Signer = (*PrivateKey)(nil)
 
 // Sign returns a matching signature for this private key
 func (p *PrivateKey) Sign(message []byte) (*Signature, error) {
+	if p.unwrap() == nil {
+		return nil, errors.New("private key missing")
+	}
 	return p.unwrap().Sign(message)
 }
 

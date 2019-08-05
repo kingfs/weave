@@ -1,6 +1,10 @@
 package app
 
-import "github.com/iov-one/weave"
+import (
+	"reflect"
+
+	"github.com/iov-one/weave"
+)
 
 // Decorators holds a chain of decorators, not yet resolved by a Handler
 type Decorators struct {
@@ -23,13 +27,27 @@ returns a Handler that will execute this whole stack.
   )
 */
 func ChainDecorators(chain ...weave.Decorator) Decorators {
+	chain = cutoffNil(chain)
 	return Decorators{}.Chain(chain...)
 }
 
 // Chain allows us to keep adding more Decorators to the chain
 func (d Decorators) Chain(chain ...weave.Decorator) Decorators {
+	chain = cutoffNil(chain)
 	newChain := append(d.chain, chain...)
 	return Decorators{newChain}
+}
+
+// cutoffNil will in-place remove all all nil values from given slice.
+func cutoffNil(ds []weave.Decorator) []weave.Decorator {
+	var cutoff int
+	for i := 0; i < len(ds); i++ {
+		ds[i-cutoff] = ds[i]
+		if ds[i] == nil || (reflect.ValueOf(ds[i]).Kind() == reflect.Ptr && reflect.ValueOf(ds[i]).IsNil()) {
+			cutoff++
+		}
+	}
+	return ds[:len(ds)-cutoff]
 }
 
 // WithHandler resolves the stack and returns a concrete Handler
@@ -58,15 +76,11 @@ type step struct {
 var _ weave.Handler = step{}
 
 // Check passes the handler into the decorator, implements Handler
-func (s step) Check(ctx weave.Context, store weave.KVStore,
-	tx weave.Tx) (weave.CheckResult, error) {
-
+func (s step) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx) (*weave.CheckResult, error) {
 	return s.d.Check(ctx, store, tx, s.next)
 }
 
 // Deliver passes the handler into the decorator, implements Handler
-func (s step) Deliver(ctx weave.Context, store weave.KVStore,
-	tx weave.Tx) (weave.DeliverResult, error) {
-
+func (s step) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx) (*weave.DeliverResult, error) {
 	return s.d.Deliver(ctx, store, tx, s.next)
 }

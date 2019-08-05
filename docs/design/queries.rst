@@ -70,7 +70,7 @@ Weave Request Types
 As we see above, the request format doesn't actually define what
 possible types are for either ``Path`` or ``Data`` and leaves it up to
 the application. This is good for a generic query interface,
-but to allow better code reuse between weave extenstions, as
+but to allow better code reuse between weave extensions, as
 well as ease of development of weave clients, we define a
 standard here for all weave modules.
 
@@ -88,34 +88,26 @@ that context. However, we can also append a modifier to change
 that behavior:
 
 * ``?prefix`` => ``Data`` is a raw prefix (query returns N results, all items that start with this prefix)
-* ``?range`` => ``Data`` is a serialized ``RangeQuery``, query returns N results as with ``prefix``
 
 Examples
 --------
 
-``cash.NewBucket`` registered under path ``wallet`` and has a ``name``
-index to query wallets based on a self-defined name string.
+`namecoin.NewWalletBucket <https://github.com/iov-one/weave/blob/master/x/namecoin/wallet.go#L107-L113>`__
+adds and a ``name`` field to the account, along with a secondary index.
+It is `registered under /wallets <https://github.com/iov-one/weave/blob/master/x/namecoin/handler.go#L52-L57>`__
+in the QueryHandler.
 
 Path: ``/``, Data: ``0123456789`` (hex):
   db.Get(``0123456789``)
 
 Path: ``/wallets``, Data: ``00CAFE00`` (hex):
-  cash.NewBucket().Get(``00CAFE00``)
+  namecoin.NewWalletBucket().Get(``00CAFE00``)
 
 Path: ``/wallets/name``, Data: "John" (raw):
-  cash.NewBucket().Index("name").Get("John")
+  namecoin.NewWalletBucket().Index("name").Get("John")
 
 Path: ``/?prefix``, Data: ``0123456789`` (hex):
   db.Iterator(``0123456789``, ``012345678A``)
-
-Path: ``/wallets?range``, Data: ``complex type to be defined``:
-  cash.NewBucket().Iterator(``start``, ``end``)
-
-Note that if we have a numeric index, the range query could be
-easily be used to generate ``<``, ``<=``, ``>``, ``>=``, and
-``BETWEEN`` queries over those values. Range is currently
-not implemented as of weave v0.4.1, but will be added as
-soon as there is a clear use case.
 
 Weave Response Types
 ====================
@@ -136,12 +128,10 @@ We define a simple protobuf format for ResultSet, which is
 used both in Key and Value, which has some helper methods
 to iterate over the pairs joined into Models.
 
-**TODO: consider pagination over range queries**
-
 Usage In Extensions
 ===================
 
-A given app can hardcode the handler for ``/``, and ``?prefix``,
+A given app can hard-code the handler for ``/``, and ``?prefix``,
 but we need a way to register these with the root handler.
 The ``app.StoreApp.Query`` method can use a lookup from ``Path``
 to handler. It will strip of the modifier (if any first), and
@@ -158,45 +148,13 @@ implements QueryHandler, just as we use ``app.Router`` and
 define ``RegisterRoutes`` in each extension. We just add
 another method ``RegisterQueries``.
 
-Proofs
-======
+Merkle Proofs
+=============
 
-**Proofs are not yet implemented as of weave v0.4.1**
+**Proofs are not yet implemented as of weave v0.14**
 This is both due to prioritization of other features,
 and also as we wish to provide a solid proof format that is
 useful for IBC as well, and watching cosmos-sdk development
-so we can maintain some compatibility.
-
-As a primative to build up proofs, we define a generic ``ProofPath``
-data type that contains a merkle proof from a ``key:value`` pair to
-a root hash. That root hash can be tied externally to a hash
-stored in the header at the given block height.
-
-We also have a MultiProof, which takes an arbitrary number of
-``ProofPaths`` (up to ca. 1000) and stores them in a compressed format,
-exploiting the fact that very many of the intermediate hashes in
-the proofs are repeated in many different paths.
-
-**TODO: will define this better later**
-
-We have four types of proofs for the different query types:
-
-* PK Single
-* PK Multi
-* Index Single
-* Index Multi
-
-Each needs it's own proof format.
-
-* Single Existence: ``Proof``
-* Single Non-Existence: ``Proof to lower``, ``Proof to higher``
-* Multi Proof: ``Proof to lower``, ``Valid Proofs``*N, ``Proof to higher``
-
-Index proofs will need one of the following proofs to prove the
-index values. Then they will have N "Single Existence" proofs for
-every returned value.
-
-These proofs will need to be packed into an envelope with enough
-information to validate all the contents, including the type of
-the proof and any conditions that we try to prove (one key or
-a range we cover).
+so we can maintain compatibility. As this format is recently
+stabilized inside the cosmos hub, implementation in weave
+should not be too far off.

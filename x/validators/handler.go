@@ -3,92 +3,105 @@ package validators
 import (
 	"github.com/iov-one/weave"
 	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/x"
 )
 
-type AuthCheckAddress = func(auth x.Authenticator, ctx weave.Context) CheckAddress
-
-var authCheckAddress = func(auth x.Authenticator, ctx weave.Context) CheckAddress {
-	return func(addr weave.Address) bool {
-		return auth.HasAddress(ctx, addr)
-	}
-}
-
 // RegisterRoutes will instantiate and register
-// all handlers in this package
-func RegisterRoutes(r weave.Registry, auth x.Authenticator,
-	control Controller) {
-
-	r.Handle(pathUpdate, NewUpdateHandler(auth, control, authCheckAddress))
+// all handlers in this package.
+func RegisterRoutes(r weave.Registry, auth x.Authenticator) {
+	bucket := NewAccountBucket()
+	r.Handle(&ApplyDiffMsg{}, migration.SchemaMigratingHandler("validators", &updateHandler{
+		auth:   auth,
+		bucket: bucket,
+	}))
 }
 
-// RegisterQuery will register this bucket as "/validators"
+// RegisterQuery will register this bucket as "/validators".
 func RegisterQuery(qr weave.QueryRouter) {
-	NewBucket().Register("validators", qr)
+	NewAccountBucket().Register("validators", qr)
 }
 
-// UpdateHandler will handle sending coins
-type UpdateHandler struct {
-	auth             x.Authenticator
-	control          Controller
-	authCheckAddress AuthCheckAddress
+type updateHandler struct {
+	auth   x.Authenticator
+	bucket *AccountBucket
 }
 
-var _ weave.Handler = UpdateHandler{}
+var _ weave.Handler = (*updateHandler)(nil)
 
-// NewUpdateHandler creates a handler for SendMsg
-func NewUpdateHandler(auth x.Authenticator, control Controller, checkAddr AuthCheckAddress) UpdateHandler {
-	return UpdateHandler{
-		auth:             auth,
-		control:          control,
-		authCheckAddress: checkAddr,
+func (h updateHandler) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx) (*weave.CheckResult, error) {
+	if _, _, err := h.validate(ctx, store, tx); err != nil {
+		return nil, err
 	}
+	return &weave.CheckResult{}, nil
 }
 
-// Check verifies all the preconditions
-func (h UpdateHandler) Check(ctx weave.Context, store weave.KVStore,
-	tx weave.Tx) (weave.CheckResult, error) {
-
-	var res weave.CheckResult
-	rmsg, err := tx.GetMsg()
+func (h updateHandler) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx) (*weave.DeliverResult, error) {
+	diff, updates, err := h.validate(ctx, store, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
-	msg, ok := rmsg.(*SetValidatorsMsg)
-	if !ok {
-		return res, errors.ErrUnknownTxType(rmsg)
-	}
-
-	_, err = h.control.CanUpdateValidators(store, h.authCheckAddress(h.auth, ctx), msg.AsABCI())
+	err = weave.StoreValidatorUpdates(store, updates)
 	if err != nil {
-		return res, err
+		return nil, errors.Wrap(err, "store validator updates")
 	}
 
-	return res, nil
+	return &weave.DeliverResult{Diff: diff}, nil
 }
 
-// Deliver provides the diff given everything is okay with permissions and such
-// Check did the same job already, so we can assume stuff goes okay
-func (h UpdateHandler) Deliver(ctx weave.Context, store weave.KVStore,
-	tx weave.Tx) (weave.DeliverResult, error) {
+// Validate returns an update diff, ValidatorUpdates to store for bookkeeping and an error.
+func (h updateHandler) validate(ctx weave.Context, store weave.KVStore, tx weave.Tx) ([]weave.ValidatorUpdate,
+	weave.ValidatorUpdates, error) {
+	var msg ApplyDiffMsg
+	var resUpdates weave.ValidatorUpdates
+	if err := weave.LoadMsg(tx, &msg); err != nil {
+		return nil, resUpdates, errors.Wrap(err, "load msg")
+	}
 
-	// ensure type and validate...
-	var res weave.DeliverResult
-	rmsg, err := tx.GetMsg()
+	diff := msg.ValidatorUpdates
+	if len(diff) == 0 {
+		return nil, resUpdates, errors.Wrap(errors.ErrEmpty, "diff")
+	}
+
+	accounts, err := h.bucket.GetAccounts(store)
 	if err != nil {
-		return res, err
-	}
-	msg, ok := rmsg.(*SetValidatorsMsg)
-	if !ok {
-		return res, errors.ErrUnknownTxType(rmsg)
+		return nil, resUpdates, err
 	}
 
-	diff, err := h.control.CanUpdateValidators(store, h.authCheckAddress(h.auth, ctx), msg.AsABCI())
+	var hasPermission bool
+	for _, addr := range accounts.Addresses {
+		if h.auth.HasAddress(ctx, addr) {
+			hasPermission = true
+			break
+		}
+	}
+	if !hasPermission {
+		return nil, resUpdates, errors.Wrap(errors.ErrUnauthorized, "no permission")
+	}
+
+	updates, err := weave.GetValidatorUpdates(store)
 	if err != nil {
-		return res, err
+		return nil, resUpdates, errors.Wrap(err, "failed to query validators")
 	}
 
-	res.Diff = diff
+	resUpdates = updates
 
-	return res, nil
+	for _, v := range diff {
+		if validator, key, ok := resUpdates.Get(v.PubKey); ok {
+			if v.Power == validator.Power {
+				return nil, resUpdates, errors.Wrap(errors.ErrInput, "same validator power")
+			}
+			resUpdates.ValidatorUpdates[key] = v
+			continue
+		}
+
+		if v.Power == 0 {
+			return nil, resUpdates, errors.Wrap(errors.ErrInput, "setting unknown validator power to 0")
+		}
+
+		resUpdates.ValidatorUpdates = append(resUpdates.ValidatorUpdates, v)
+	}
+
+	// Deduplicate updates for storage.
+	return diff, resUpdates.Deduplicate(true), nil
 }

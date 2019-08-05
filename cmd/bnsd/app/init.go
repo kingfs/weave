@@ -1,18 +1,29 @@
-package app
+package bnsd
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path/filepath"
 
-	abci "github.com/tendermint/abci/types"
-	"github.com/tendermint/tmlibs/log"
-
 	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/app"
+	"github.com/iov-one/weave/cmd/bnsd/x/username"
+	"github.com/iov-one/weave/coin"
+	"github.com/iov-one/weave/commands/server"
 	"github.com/iov-one/weave/crypto"
-	"github.com/iov-one/weave/x"
-	"github.com/iov-one/weave/x/namecoin"
+	"github.com/iov-one/weave/migration"
+	"github.com/iov-one/weave/x/cash"
+	"github.com/iov-one/weave/x/currency"
+	"github.com/iov-one/weave/x/distribution"
+	"github.com/iov-one/weave/x/escrow"
+	"github.com/iov-one/weave/x/gov"
+	"github.com/iov-one/weave/x/msgfee"
+	"github.com/iov-one/weave/x/multisig"
+	"github.com/iov-one/weave/x/validators"
+	abci "github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
 // GenInitOptions will produce some basic options for one rich
@@ -23,7 +34,7 @@ func GenInitOptions(args []string) (json.RawMessage, error) {
 	ticker := "IOV"
 	if len(args) > 0 {
 		ticker = args[0]
-		if !x.IsCC(ticker) {
+		if !coin.IsCC(ticker) {
 			return nil, fmt.Errorf("Invalid ticker %s", ticker)
 		}
 	}
@@ -42,49 +53,69 @@ func GenInitOptions(args []string) (json.RawMessage, error) {
 		fmt.Println(phrase)
 	}
 
-	opts := fmt.Sprintf(`{
-    "wallets": [
-      {
-        "address": "%s",
-        "name": "admin",
-        "coins": [
+	opts := fmt.Sprintf(`
           {
-            "whole": 123456789,
-            "ticker": "%s"
+            "cash": [
+              {
+                "address": "%s",
+                "coins": [
+                  {"whole": 123456789, "ticker": "%s"}
+                ]
+              }
+            ],
+            "currencies": [],
+            "multisig": [],
+	    "update_validators": {
+              "addresses": ["%s"]
+	    },
+	    "distribution": []
           }
-        ]
-      }
-    ],
-    "tokens": [
-      {
-        "ticker": "%s",
-        "name": "Main token of this chain",
-        "sig_figs": 6
-      }
-    ]
-  }`, addr, ticker, ticker)
+	`, addr, ticker, addr)
 	return []byte(opts), nil
 }
 
 // GenerateApp is used to create a stub for server/start.go command
-func GenerateApp(home string, logger log.Logger, debug bool) (abci.Application, error) {
-	// db goes in a subdir, but "" -> "" for memdb
+func GenerateApp(options *server.Options) (abci.Application, error) {
+	// db goes in a subdir, but "" stays "" to use memdb
 	var dbPath string
-	if home != "" {
-		dbPath = filepath.Join(home, "bov.db")
+	if options.Home != "" {
+		dbPath = filepath.Join(options.Home, "bns.db")
 	}
 
-	// TODO: anyone can make a token????
-	stack := Stack(x.Coin{}, nil)
-	app, err := Application("bnsd", stack, TxDecoder, dbPath, debug)
+	stack := Stack(nil, options.MinFee)
+	application, err := Application("bnsd", stack, TxDecoder, dbPath, options)
 	if err != nil {
 		return nil, err
 	}
-	app.WithInit(namecoin.Initializer{})
+	return DecorateApp(application, options.Logger), nil
+}
 
-	// set the logger and return
-	app.WithLogger(logger)
-	return app, nil
+// DecorateApp adds initializers and Logger to an Application
+func DecorateApp(application app.BaseApp, logger log.Logger) app.BaseApp {
+	application.WithInit(app.ChainInitializers(
+		&migration.Initializer{},
+		&multisig.Initializer{},
+		&cash.Initializer{},
+		&currency.Initializer{},
+		&validators.Initializer{},
+		&distribution.Initializer{},
+		&msgfee.Initializer{},
+		&escrow.Initializer{Minter: cash.NewController(cash.NewBucket())},
+		&gov.Initializer{},
+		&username.Initializer{},
+	))
+	application.WithLogger(logger)
+	return application
+}
+
+// InlineApp will take a previously prepared CommitStore and return a complete Application
+func InlineApp(kv weave.CommitKVStore, logger log.Logger, debug bool) abci.Application {
+	minFee := coin.Coin{}
+	stack := Stack(nil, minFee)
+	ctx := context.Background()
+	store := app.NewStoreApp("bnsd", kv, QueryRouter(minFee), ctx)
+	base := app.NewBaseApp(store, TxDecoder, stack, nil, debug)
+	return DecorateApp(base, logger)
 }
 
 type output struct {

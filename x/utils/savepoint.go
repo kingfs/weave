@@ -2,6 +2,7 @@ package utils
 
 import (
 	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
 )
 
 // Savepoint will isolate all data inside of the call,
@@ -36,9 +37,7 @@ func (s Savepoint) OnDeliver() Savepoint {
 }
 
 // Check will optionally set a checkpoint
-func (s Savepoint) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx,
-	next weave.Checker) (weave.CheckResult, error) {
-
+func (s Savepoint) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Checker) (*weave.CheckResult, error) {
 	if !s.onCheck {
 		return next.Check(ctx, store, tx)
 	}
@@ -49,19 +48,18 @@ func (s Savepoint) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx,
 	}
 
 	cache := cstore.CacheWrap()
-	res, err := next.Check(ctx, cache, tx)
-	if err == nil {
-		cache.Write()
-	} else {
+	if res, err := next.Check(ctx, cache, tx); err != nil {
 		cache.Discard()
+		return nil, err
+	} else if werr := cache.Write(); werr != nil {
+		return nil, errors.Wrap(werr, "writing savepoint")
+	} else {
+		return res, nil
 	}
-	return res, err
 }
 
 // Deliver will optionally set a checkpoint
-func (s Savepoint) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx,
-	next weave.Deliverer) (weave.DeliverResult, error) {
-
+func (s Savepoint) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Deliverer) (*weave.DeliverResult, error) {
 	if !s.onDeliver {
 		return next.Deliver(ctx, store, tx)
 	}
@@ -72,11 +70,12 @@ func (s Savepoint) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx,
 	}
 
 	cache := cstore.CacheWrap()
-	res, err := next.Deliver(ctx, cache, tx)
-	if err == nil {
-		cache.Write()
-	} else {
+	if res, err := next.Deliver(ctx, cache, tx); err != nil {
 		cache.Discard()
+		return nil, err
+	} else if werr := cache.Write(); werr != nil {
+		return nil, errors.Wrap(werr, "writing savepoint")
+	} else {
+		return res, nil
 	}
-	return res, err
 }

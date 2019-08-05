@@ -50,7 +50,7 @@ Or the `app/results.proto <https://github.com/iov-one/weave/blob/master/app/resu
     }
 
 Note that the package defined in the protobuf file must match the
-package name used by the golang code in the same directory.
+package name used by the Go language code in the same directory.
 
 You can also import types from one proto file into another.
 Make sure to use the full github path in order that the generated
@@ -128,7 +128,7 @@ resolved by adding ``-I=.`` as well:
     (e.g. absolute and relative) are equivalent (it's harder than you think).
 
 You are welcome to use other codecs than ``gogofaster``, you can also
-try the standard golang protobuf compiler. What this mode goes is
+try the standard Go language protobuf compiler. What this mode goes is
 auto-generate static code for serialization and deserialization of the
 type. It performs the introspection one time to generate efficient code
 allowing us to avoid the use of reflection at runtime and get ~10x
@@ -226,12 +226,12 @@ in compile-time and we can switch on the kind on runtime, quite nice.
 
   oneof sum{
     cash.SendMsg send_msg = 1;
-    namecoin.NewTokenMsg new_token_msg = 2;
+    namecoin.CreateTokenMsg new_token_msg = 2;
     namecoin.SetWalletNameMsg set_name_msg = 3;
-    escrow.CreateEscrowMsg create_escrow_msg = 4;
-    escrow.ReleaseEscrowMsg release_escrow_msg = 5;
-    escrow.ReturnEscrowMsg return_escrow_msg = 6;
-    escrow.UpdateEscrowPartiesMsg update_escrow_msg = 7;
+    escrow.CreateMsg create_escrow_msg = 4;
+    escrow.ReleaseMsg release_escrow_msg = 5;
+    escrow.ReturnMsg return_escrow_msg = 6;
+    escrow.UpdatePartiesMsg update_escrow_msg = 7;
   }
 
 The only problem is that the generated code is ugly to some people's eyes.
@@ -250,11 +250,11 @@ Here are the relevant pieces:
         //
         // Types that are valid to be assigned to Sum:
         //  *Tx_SendMsg
-        //  *Tx_NewTokenMsg
+        //  *Tx_CreateTokenMsg
         //  *Tx_SetNameMsg
-        //  *Tx_CreateEscrowMsg
-        //  *Tx_ReleaseEscrowMsg
-        //  *Tx_ReturnEscrowMsg
+        //  *Tx_CreateMsg
+        //  *Tx_ReleaseMsg
+        //  *Tx_ReturnMsg
         //  *Tx_UpdateEscrowMsg
         Sum isTx_Sum `protobuf_oneof:"sum"`
     ...
@@ -269,8 +269,8 @@ Here are the relevant pieces:
     type Tx_SendMsg struct {
         SendMsg *cash.SendMsg `protobuf:"bytes,1,opt,name=send_msg,json=sendMsg,oneof"`
     }
-    type Tx_NewTokenMsg struct {
-        NewTokenMsg *namecoin.NewTokenMsg `protobuf:"bytes,2,opt,name=new_token_msg,json=newTokenMsg,oneof"`
+    type Tx_CreateTokenMsg struct {
+        CreateTokenMsg *namecoin.CreateTokenMsg `protobuf:"bytes,2,opt,name=new_token_msg,json=newTokenMsg,oneof"`
     }
 
 We now have some intermediate structs that give us a layer of indirection
@@ -286,14 +286,14 @@ possible ``tx.Sum`` fields, with
         return t.SendMsg, nil
     case *Tx_SetNameMsg:
         return t.SetNameMsg, nil
-    case *Tx_NewTokenMsg:
-        return t.NewTokenMsg, nil
-    case *Tx_CreateEscrowMsg:
-        return t.CreateEscrowMsg, nil
-    case *Tx_ReleaseEscrowMsg:
-        return t.ReleaseEscrowMsg, nil
-    case *Tx_ReturnEscrowMsg:
-        return t.ReturnEscrowMsg, nil
+    case *Tx_CreateTokenMsg:
+        return t.CreateTokenMsg, nil
+    case *Tx_CreateMsg:
+        return t.CreateMsg, nil
+    case *Tx_ReleaseMsg:
+        return t.ReleaseMsg, nil
+    case *Tx_ReturnMsg:
+        return t.ReturnMsg, nil
     case *Tx_UpdateEscrowMsg:
         return t.UpdateEscrowMsg, nil
     }

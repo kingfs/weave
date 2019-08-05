@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"sort"
 
-	"github.com/pkg/errors"
+	"github.com/iov-one/weave/errors"
 )
 
 var _ CloneableData = (*MultiRef)(nil)
@@ -36,7 +36,7 @@ func multiRefFromStrings(strs ...string) (*MultiRef, error) {
 func (m *MultiRef) Add(ref []byte) error {
 	i, found := m.findRef(ref)
 	if found {
-		return ErrRemoveUnregistered()
+		return errors.Wrap(errors.ErrNotFound, "cannot add a ref twice")
 	}
 	// append to end
 	if i == len(m.Refs) {
@@ -55,7 +55,7 @@ func (m *MultiRef) Add(ref []byte) error {
 func (m *MultiRef) Remove(ref []byte) error {
 	i, found := m.findRef(ref)
 	if !found {
-		return ErrRemoveUnregistered()
+		return errors.Wrap(errors.ErrNotFound, "cannot remove non-existent ref")
 	}
 	// splice it out
 	m.Refs = append(m.Refs[:i], m.Refs[i+1:]...)
@@ -91,16 +91,14 @@ func (m *MultiRef) findRef(ref []byte) (int, bool) {
 func (m *MultiRef) Copy() CloneableData {
 	// shallow copy...
 	refs := make([][]byte, len(m.Refs))
-	for i, r := range m.Refs {
-		refs[i] = r
-	}
+	copy(refs, m.Refs)
 	return &MultiRef{Refs: refs}
 }
 
 // Validate just returns an error if empty
 func (m *MultiRef) Validate() error {
 	if len(m.GetRefs()) == 0 {
-		return ErrNoRefs()
+		return errors.Wrap(errors.ErrEmpty, "no references")
 	}
 	return nil
 }
@@ -122,7 +120,7 @@ func (c *Counter) Copy() CloneableData {
 // Validate returns error on negative numbers
 func (c *Counter) Validate() error {
 	if c.Count < 0 {
-		return errors.New("Negative counter")
+		return errors.Wrap(errors.ErrState, "negative counter")
 	}
 	return nil
 }

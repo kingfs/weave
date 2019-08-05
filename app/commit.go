@@ -5,23 +5,22 @@ import (
 	"github.com/iov-one/weave/errors"
 )
 
-// commitStore is an internal type to handle loading from a
-// KVCommitStore, maintaining different CacheWraps for
-// Deliver and Check, and returning useful state info.
-type commitStore struct {
+// CommitStore handles loading from a KVCommitStore, maintaining different
+// CacheWraps for Deliver and Check, and returning useful state info.
+type CommitStore struct {
 	committed weave.CommitKVStore
 	deliver   weave.KVCacheWrap
 	check     weave.KVCacheWrap
 }
 
-// newCommitStore loads the CommitKVStore from disk or panics
-// Sets up the deliver and check caches
-func newCommitStore(store weave.CommitKVStore) *commitStore {
+// NewCommitStore loads the CommitKVStore from disk or panics. It sets up the
+// deliver and check caches.
+func NewCommitStore(store weave.CommitKVStore) *CommitStore {
 	err := store.LoadLatestVersion()
 	if err != nil {
 		panic(err)
 	}
-	return &commitStore{
+	return &CommitStore{
 		committed: store,
 		deliver:   store.CacheWrap(),
 		check:     store.CacheWrap(),
@@ -29,9 +28,8 @@ func newCommitStore(store weave.CommitKVStore) *commitStore {
 }
 
 // CommitInfo returns the current height and hash
-func (cs *commitStore) CommitInfo() (version int64, hash []byte) {
-	id := cs.committed.LatestVersion()
-	return id.Version, id.Hash
+func (cs *CommitStore) CommitInfo() (weave.CommitID, error) {
+	return cs.committed.LatestVersion()
 }
 
 // Commit will flush deliver to the underlying store and commit it
@@ -39,18 +37,35 @@ func (cs *commitStore) CommitInfo() (version int64, hash []byte) {
 //
 // TODO: this should probably be protected by a mutex....
 // need to think what concurrency we expect
-func (cs *commitStore) Commit() weave.CommitID {
+func (cs *CommitStore) Commit() (weave.CommitID, error) {
 	// flush deliver to store and discard check
-	cs.deliver.Write()
+	if err := cs.deliver.Write(); err != nil {
+		return weave.CommitID{}, err
+	}
 	cs.check.Discard()
 
 	// write the store to disk
-	res := cs.committed.Commit()
+	res, err := cs.committed.Commit()
+	if err != nil {
+		return res, err
+	}
 
 	// set up new caches
 	cs.deliver = cs.committed.CacheWrap()
 	cs.check = cs.committed.CacheWrap()
-	return res
+	return res, nil
+}
+
+// CheckStore returns a store implementation that must be used during the
+// checking phase.
+func (cs *CommitStore) CheckStore() weave.CacheableKVStore {
+	return cs.check
+}
+
+// DeliverStore returns a store implementation that must be used during the
+// delivery phase.
+func (cs *CommitStore) DeliverStore() weave.CacheableKVStore {
+	return cs.deliver
 }
 
 //------- storing chainID ---------
@@ -58,9 +73,13 @@ func (cs *commitStore) Commit() weave.CommitID {
 // _wv: is a prefix for weave internal data
 const chainIDKey = "_wv:chainID"
 
-// loadChainID returns the chain id stored if any
-func loadChainID(kv weave.KVStore) string {
-	v := kv.Get([]byte(chainIDKey))
+// mustLoadChainID returns the chain id stored if any
+// panics on db error
+func mustLoadChainID(kv weave.KVStore) string {
+	v, err := kv.Get([]byte(chainIDKey))
+	if err != nil {
+		panic(err)
+	}
 	return string(v)
 }
 
@@ -68,12 +87,19 @@ func loadChainID(kv weave.KVStore) string {
 // Returns error if already set, or invalid name
 func saveChainID(kv weave.KVStore, chainID string) error {
 	if !weave.IsValidChainID(chainID) {
-		return errors.ErrInvalidChainID(chainID)
+		return errors.Wrapf(errors.ErrInput, "chain id: %v", chainID)
 	}
 	k := []byte(chainIDKey)
-	if kv.Has(k) {
-		return errors.ErrModifyChainID()
+	exists, err := kv.Has(k)
+	if err != nil {
+		return errors.Wrap(err, "load chainId")
 	}
-	kv.Set(k, []byte(chainID))
+	if exists {
+		return errors.Wrap(errors.ErrUnauthorized, "can't modify chain id after genesis init")
+	}
+	err = kv.Set(k, []byte(chainID))
+	if err != nil {
+		return errors.Wrap(err, "save chainId")
+	}
 	return nil
 }

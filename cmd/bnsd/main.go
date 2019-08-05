@@ -6,12 +6,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/tendermint/tmlibs/log"
-
 	"github.com/iov-one/weave"
-	"github.com/iov-one/weave/cmd/bnsd/app"
+	bnsd "github.com/iov-one/weave/cmd/bnsd/app"
 	"github.com/iov-one/weave/commands"
 	"github.com/iov-one/weave/commands/server"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
 var (
@@ -20,28 +19,30 @@ var (
 )
 
 func init() {
-	defaultHome := filepath.Join(os.ExpandEnv("$HOME"), ".bov")
+	defaultHome := filepath.Join(os.ExpandEnv("$HOME"), ".bns")
 	varHome = flag.String(flagHome, defaultHome, "directory to store files under")
 
 	flag.CommandLine.Usage = helpMessage
 }
 
 func helpMessage() {
-	fmt.Println("bov")
-	fmt.Println("        Blockchain of Value node")
+	fmt.Println("bnsd")
+	fmt.Println("          Blockchain Name Service node")
 	fmt.Println("")
-	fmt.Println("help    Print this message")
-	fmt.Println("init    Initialize app options in genesis file")
-	fmt.Println("start   Run the abci server")
-	fmt.Println("version Print the app version")
+	fmt.Println("help      Print this message")
+	fmt.Println("init      Initialize app options in genesis file")
+	fmt.Println("start     Run the abci server")
+	fmt.Println("getblock  Extract a block from blockchain.db")
+	fmt.Println("retry     Run last block again to ensure it produces same result")
+	fmt.Println("version   Print the app version")
 	fmt.Println(`
   -home string
-        directory to store files under (default "$HOME/.bov")`)
+        directory to store files under (default "$HOME/.bns")`)
 }
 
 func main() {
 	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout)).
-		With("module", "bov")
+		With("module", "bns")
 
 	flag.Parse()
 	if flag.NArg() == 0 {
@@ -58,11 +59,15 @@ func main() {
 	case "help":
 		helpMessage()
 	case "init":
-		err = server.InitCmd(app.GenInitOptions, logger, *varHome, rest)
+		err = server.InitCmd(bnsd.GenInitOptions, logger, *varHome, rest)
 	case "start":
-		err = server.StartCmd(app.GenerateApp, logger, *varHome, rest)
+		err = server.StartCmd(bnsd.GenerateApp, logger, *varHome, rest)
+	case "getblock":
+		err = server.GetBlockCmd(rest)
+	case "retry":
+		err = server.RetryCmd(bnsd.InlineApp, logger, *varHome, rest)
 	case "testgen":
-		err = commands.TestGenCmd(app.Examples(), rest)
+		err = commands.TestGenCmd(bnsd.Examples(), rest)
 	case "version":
 		fmt.Println(weave.Version)
 	default:

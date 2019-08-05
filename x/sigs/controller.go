@@ -65,7 +65,7 @@ func VerifySignature(db weave.KVStore, sig *StdSignature,
 	bucket := NewBucket()
 
 	// load account
-	obj, err := bucket.GetOrCreate(db, sig.PubKey)
+	obj, err := bucket.GetOrCreate(db, sig.Pubkey)
 	if err != nil {
 		return nil, err
 	}
@@ -76,8 +76,8 @@ func VerifySignature(db weave.KVStore, sig *StdSignature,
 	}
 
 	user := AsUser(obj)
-	if !user.PubKey.Verify(toSign, sig.Signature) {
-		return nil, errors.ErrInvalidSignature()
+	if !user.Pubkey.Verify(toSign, sig.Signature) {
+		return nil, errors.Wrap(errors.ErrUnauthorized, "invalid signature")
 	}
 
 	err = user.CheckAndIncrementSequence(sig.Sequence)
@@ -88,7 +88,7 @@ func VerifySignature(db weave.KVStore, sig *StdSignature,
 	if err != nil {
 		return nil, err
 	}
-	return user.PubKey.Condition(), nil
+	return user.Pubkey.Condition(), nil
 }
 
 /*
@@ -105,10 +105,10 @@ the public key signing/verification step
 */
 func BuildSignBytes(signBytes []byte, chainID string, seq int64) ([]byte, error) {
 	if seq < 0 {
-		return nil, ErrInvalidSequence("negative")
+		return nil, errors.Wrap(ErrInvalidSequence, "negative")
 	}
 	if !weave.IsValidChainID(chainID) {
-		return nil, errors.ErrInvalidChainID(chainID)
+		return nil, errors.Wrapf(errors.ErrInput, "chain id: %v", chainID)
 	}
 
 	// encode nonce as 8 byte, big-endian
@@ -155,7 +155,7 @@ func SignTx(signer crypto.Signer, tx SignedTx, chainID string,
 	pub := signer.PublicKey()
 
 	res := &StdSignature{
-		PubKey:    pub,
+		Pubkey:    pub,
 		Signature: sig,
 		Sequence:  seq,
 	}

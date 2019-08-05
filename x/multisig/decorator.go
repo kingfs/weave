@@ -2,13 +2,19 @@ package multisig
 
 import (
 	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/orm"
 	"github.com/iov-one/weave/x"
+)
+
+const (
+	multisigParticipantGasCost = 10
 )
 
 // Decorator checks multisig contract if available
 type Decorator struct {
 	auth   x.Authenticator
-	bucket ContractBucket
+	bucket orm.ModelBucket
 }
 
 var _ weave.Decorator = Decorator{}
@@ -19,75 +25,68 @@ func NewDecorator(auth x.Authenticator) Decorator {
 }
 
 // Check enforce multisig contract before calling down the stack
-func (d Decorator) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Checker) (weave.CheckResult, error) {
-	var res weave.CheckResult
-	newCtx, err := d.withMultisig(ctx, store, tx)
+func (d Decorator) Check(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Checker) (*weave.CheckResult, error) {
+	newCtx, cost, err := d.authMultisig(ctx, store, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 
-	return next.Check(newCtx, store, tx)
+	res, err := next.Check(newCtx, store, tx)
+	if err != nil {
+		return nil, err
+	}
+	res.GasPayment += cost
+	return res, nil
 }
 
 // Deliver enforces multisig contract before calling down the stack
-func (d Decorator) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Deliverer) (weave.DeliverResult, error) {
-	var res weave.DeliverResult
-	newCtx, err := d.withMultisig(ctx, store, tx)
+func (d Decorator) Deliver(ctx weave.Context, store weave.KVStore, tx weave.Tx, next weave.Deliverer) (*weave.DeliverResult, error) {
+	newCtx, _, err := d.authMultisig(ctx, store, tx)
 	if err != nil {
-		return res, err
+		return nil, err
 	}
 
 	return next.Deliver(newCtx, store, tx)
 }
 
-func (d Decorator) withMultisig(ctx weave.Context, store weave.KVStore, tx weave.Tx) (weave.Context, error) {
-	if multisigContract, ok := tx.(MultiSigTx); ok {
-		ids := multisigContract.GetMultisig()
-		for _, contractID := range ids {
-			if contractID == nil {
-				return ctx, nil
-			}
+func (d Decorator) authMultisig(ctx weave.Context, store weave.KVStore, tx weave.Tx) (weave.Context, int64, error) {
+	multisigContract, ok := tx.(MultiSigTx)
+	if !ok {
+		return ctx, 0, nil
+	}
 
-			// check if we already have it
-			if d.auth.HasAddress(ctx, MultiSigCondition(contractID).Address()) {
-				return ctx, nil
-			}
-
-			// load contract
-			contract, err := d.getContract(store, contractID)
-			if err != nil {
-				return ctx, err
-			}
-
-			// collect all sigs
-			sigs := make([]weave.Address, len(contract.Sigs))
-			for i, sig := range contract.Sigs {
-				sigs[i] = sig
-			}
-
-			// check sigs (can be sig or multisig)
-			authenticated := x.HasNAddresses(ctx, d.auth, sigs, int(contract.ActivationThreshold))
-			if !authenticated {
-				return ctx, ErrUnauthorizedMultiSig(contractID)
-			}
-
-			ctx = withMultisig(ctx, contractID)
+	var gasCost int64
+	ids := multisigContract.GetMultisig()
+	for _, contractID := range ids {
+		if contractID == nil {
+			continue
 		}
+
+		// A contract can be activated by another contract being fulfilled.
+		if d.auth.HasAddress(ctx, MultiSigCondition(contractID).Address()) {
+			continue
+		}
+
+		var contract Contract
+		if err := d.bucket.One(store, contractID, &contract); err != nil {
+			return ctx, 0, errors.Wrap(err, "cannot load contract from the store")
+		}
+
+		var weight Weight
+		for _, p := range contract.Participants {
+			if d.auth.HasAddress(ctx, p.Signature) {
+				weight += p.Weight
+				gasCost += multisigParticipantGasCost
+			}
+		}
+		if weight < contract.ActivationThreshold {
+			err := errors.Wrapf(errors.ErrUnauthorized,
+				"%d weight is not enough to activate %q", weight, contractID)
+			return ctx, 0, err
+		}
+
+		ctx = withMultisig(ctx, contractID)
 	}
 
-	return ctx, nil
-}
-
-func (d Decorator) getContract(store weave.KVStore, id []byte) (*Contract, error) {
-	obj, err := d.bucket.Get(store, id)
-	if err != nil {
-		return nil, err
-	}
-
-	if obj == nil || (obj != nil && obj.Value() == nil) {
-		return nil, ErrContractNotFound(id)
-	}
-
-	contract := obj.Value().(*Contract)
-	return contract, err
+	return ctx, gasCost, nil
 }

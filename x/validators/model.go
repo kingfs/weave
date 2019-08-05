@@ -1,15 +1,22 @@
 package validators
 
 import (
+	"fmt"
+
 	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/orm"
 )
 
+func init() {
+	migration.MustRegister(1, &Accounts{}, migration.NoModification)
+}
+
 const (
-	// BucketName contains address that are allowed to update validators
-	BucketName = "uvalid"
-	// Key is used to store account data
-	Key = "accounts"
+	// bucketName contains address that are allowed to update validators
+	bucketName     = "uvalid"
+	accountListKey = "accounts"
 )
 
 // WeaveAccounts is used to parse the json from genesis file
@@ -19,14 +26,11 @@ type WeaveAccounts struct {
 }
 
 func (wa WeaveAccounts) Validate() error {
-	for _, v := range wa.Addresses {
-		err := v.Validate()
-		if err != nil {
-			return err
-		}
+	var errs error
+	for i, v := range wa.Addresses {
+		errs = errors.AppendField(errs, fmt.Sprintf("Addresses.%d", i), v.Validate())
 	}
-
-	return nil
+	return errs
 }
 
 func AsWeaveAccounts(a *Accounts) WeaveAccounts {
@@ -42,7 +46,10 @@ func AsAccounts(a WeaveAccounts) *Accounts {
 	for k, v := range a.Addresses {
 		addrs[k] = []byte(v)
 	}
-	return &Accounts{Addresses: addrs}
+	return &Accounts{
+		Metadata:  &weave.Metadata{Schema: 1},
+		Addresses: addrs,
+	}
 }
 
 // Copy makes new accounts object with the same addresses
@@ -54,54 +61,47 @@ func (m *Accounts) Copy() orm.CloneableData {
 		addrSlice[k] = addr
 	}
 	return &Accounts{
+		Metadata:  m.Metadata.Copy(),
 		Addresses: addrSlice,
 	}
 }
 
 func (m *Accounts) Validate() error {
-	return AsWeaveAccounts(m).Validate()
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	errs = errors.Append(errs, AsWeaveAccounts(m).Validate())
+	return errs
 }
 
-func GetAccounts(bucket orm.Bucket, kv weave.KVStore) (*Accounts, error) {
-	res, err := bucket.Get(kv, []byte(Key))
+type AccountBucket struct {
+	orm.Bucket
+}
+
+func NewAccountBucket() *AccountBucket {
+	obj := orm.NewSimpleObj([]byte(accountListKey), &Accounts{
+		Metadata: &weave.Metadata{Schema: 1},
+	})
+	return &AccountBucket{
+		Bucket: migration.NewBucket("validators", bucketName, obj),
+	}
+}
+
+func (b *AccountBucket) GetAccounts(kv weave.KVStore) (*Accounts, error) {
+	res, err := b.Get(kv, []byte(accountListKey))
 	if err != nil {
 		return nil, err
 	}
-
 	if res == nil {
-		return nil, ErrWrongType(nil)
+		return nil, errors.Wrap(errors.ErrNotFound, "account")
 	}
-	switch t := res.Value().(type) {
-	case *Accounts:
-		return t, nil
-	default:
-		return nil, ErrWrongType(t)
+	acc, ok := res.Value().(*Accounts)
+	if !ok {
+		return nil, errors.Wrapf(errors.ErrType, "%T", res.Value())
 	}
-
-}
-
-func HasPermission(accts WeaveAccounts, checkAddress CheckAddress) bool {
-
-	for _, v := range accts.Addresses {
-		if checkAddress(v) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func NewBucket() orm.Bucket {
-	return orm.NewBucket(BucketName, NewAccounts())
+	return acc, nil
 }
 
 func AccountsWith(acct WeaveAccounts) orm.Object {
 	acc := AsAccounts(acct)
-	return orm.NewSimpleObj([]byte(Key), acc)
-}
-
-// NewWallet creates an empty wallet with this address
-// serves as an object for the bucket
-func NewAccounts() orm.Object {
-	return orm.NewSimpleObj([]byte(Key), new(Accounts))
+	return orm.NewSimpleObj([]byte(accountListKey), acc)
 }

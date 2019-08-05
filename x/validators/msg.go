@@ -1,38 +1,40 @@
 package validators
 
 import (
+	fmt "fmt"
+
 	"github.com/iov-one/weave"
-	abci "github.com/tendermint/abci/types"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
+	abci "github.com/tendermint/tendermint/abci/types"
 )
 
-// Ensure we implement the Msg interface
-var _ weave.Msg = (*SetValidatorsMsg)(nil)
-
-const pathUpdate = "validators/update"
-
-// Path returns the routing path for this message
-func (*SetValidatorsMsg) Path() string {
-	return pathUpdate
+func init() {
+	migration.MustRegister(1, &ApplyDiffMsg{}, migration.NoModification)
 }
 
-func (m Validator) AsABCI() abci.Validator {
-	return abci.Validator{
-		Address: m.Address,
-		PubKey:  m.PubKey.AsABCI(),
-		Power:   m.Power,
+var _ weave.Msg = (*ApplyDiffMsg)(nil)
+
+// Path implements weave.Msg interface.
+func (*ApplyDiffMsg) Path() string {
+	return "validators/apply_diff"
+}
+
+func (m *ApplyDiffMsg) Validate() error {
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", m.Metadata.Validate())
+	if len(m.ValidatorUpdates) == 0 {
+		errs = errors.AppendField(errs, "ValidatorUpdates", errors.ErrEmpty)
 	}
-}
-
-func (m PubKey) AsABCI() abci.PubKey {
-	return abci.PubKey{
-		Data: m.Data,
-		Type: m.Type,
+	for i, v := range m.ValidatorUpdates {
+		errs = errors.AppendField(errs, fmt.Sprintf("ValidatorUpdates.%d", i), v.Validate())
 	}
+	return errs
 }
 
-func (m *SetValidatorsMsg) AsABCI() []abci.Validator {
-	validators := make([]abci.Validator, len(m.Validators))
-	for k, v := range m.Validators {
+func (m *ApplyDiffMsg) AsABCI() []abci.ValidatorUpdate {
+	validators := make([]abci.ValidatorUpdate, len(m.ValidatorUpdates))
+	for k, v := range m.ValidatorUpdates {
 		validators[k] = v.AsABCI()
 	}
 

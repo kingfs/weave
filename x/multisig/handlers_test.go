@@ -4,244 +4,299 @@ import (
 	"context"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
-	"github.com/iov-one/weave/store"
-
 	"github.com/iov-one/weave"
-	"github.com/iov-one/weave/x"
+	"github.com/iov-one/weave/app"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
+	"github.com/iov-one/weave/store"
+	"github.com/iov-one/weave/weavetest"
+	"github.com/iov-one/weave/weavetest/assert"
 )
 
-var (
-	newTx   = x.TestHelpers{}.MockTx
-	helpers = x.TestHelpers{}
-)
+func TestCreateContractHandler(t *testing.T) {
+	alice := weavetest.NewCondition().Address()
+	bobby := weavetest.NewCondition().Address()
+	cindy := weavetest.NewCondition().Address()
 
-// newContextWithAuth creates a context with perms as signers and sets the height
-func newContextWithAuth(perms ...weave.Condition) (weave.Context, x.Authenticator) {
-	ctx := context.Background()
-	// Set current block height to 100
-	ctx = weave.WithHeight(ctx, 100)
-	auth := helpers.CtxAuth("authKey")
-	// Create a new context and add addr to the list of signers
-	return auth.SetConditions(ctx, perms...), auth
-}
-
-// newSigs creates an array with addresses from each condition
-func newSigs(perms ...weave.Condition) [][]byte {
-	// initial addresses controlling contract
-	var sigs [][]byte
-	for _, p := range perms {
-		sigs = append(sigs, p.Address())
-	}
-	return sigs
-}
-
-// queryContract queries a contract from the bucket and handles errors
-// so you get a strongly typed object or a test failure
-func queryContract(t *testing.T, db weave.KVStore, bucket ContractBucket, id []byte) Contract {
-	// run query
-	contracts, err := bucket.Query(db, "", id)
-	require.NoError(t, err)
-	require.Len(t, contracts, 1)
-
-	actual, err := bucket.Parse(nil, contracts[0].Value)
-	require.NoError(t, err)
-
-	return *actual.Value().(*Contract)
-}
-
-func withContract(t *testing.T, db weave.KVStore, msg CreateContractMsg) []byte {
-	_, k := helpers.MakeKey()
-	ctx, auth := newContextWithAuth(k)
-	handler := CreateContractMsgHandler{auth, NewContractBucket()}
-	res, err := handler.Deliver(
-		ctx,
-		db,
-		newTx(&msg))
-	require.NoError(t, err)
-	return res.Data
-}
-
-func TestCreateContractMsgHandler(t *testing.T) {
-	_, a := helpers.MakeKey()
-	_, b := helpers.MakeKey()
-	_, c := helpers.MakeKey()
-
-	testcases := []struct {
-		name string
-		msg  *CreateContractMsg
-		err  error
+	cases := map[string]struct {
+		Msg            weave.Msg
+		WantCheckErr   *errors.Error
+		WantDeliverErr *errors.Error
 	}{
-		{
-			name: "valid use case",
-			msg: &CreateContractMsg{
-				Sigs:                newSigs(a, b, c),
+		"successfully create a contract": {
+			Msg: &CreateMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
 				ActivationThreshold: 2,
 				AdminThreshold:      3,
 			},
-			err: nil,
 		},
-		{
-			name: "missing sigs",
-			msg:  &CreateContractMsg{},
-			err:  ErrMissingSigs(),
-		},
-		{
-			name: "bad activation threshold",
-			msg: &CreateContractMsg{
-				Sigs:                newSigs(a, b, c),
-				ActivationThreshold: 4,
+		"cannot create a contract without participants": {
+			Msg: &CreateMsg{
+				Metadata:            &weave.Metadata{Schema: 1},
+				Participants:        []*Participant{},
+				ActivationThreshold: 2,
 				AdminThreshold:      3,
 			},
-			err: ErrInvalidActivationThreshold(),
+			WantCheckErr: errors.ErrMsg,
 		},
-		{
-			name: "bad admin threshold",
-			msg: &CreateContractMsg{
-				Sigs:                newSigs(a, b, c),
-				ActivationThreshold: 1,
-				AdminThreshold:      -1,
+		"cannot create if activation threshold is too high": {
+			Msg: &CreateMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 7, // higher than total
+				AdminThreshold:      3,
 			},
-			err: ErrInvalidChangeThreshold(),
+			WantCheckErr: errors.ErrMsg,
 		},
-		{
-			name: "0 activation threshold",
-			msg: &CreateContractMsg{
-				Sigs:                newSigs(a, b, c),
-				ActivationThreshold: 0,
+		"can create if admin threshold is higher than total participants power": {
+			Msg: &CreateMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 2,
+				AdminThreshold:      maxWeightValue,
+			},
+		},
+		"cannot create if activation threshold is higher than admin threshold": {
+			Msg: &CreateMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				Participants: []*Participant{
+					{Weight: 2, Signature: alice},
+					{Weight: 2, Signature: bobby},
+				},
+				ActivationThreshold: 2,
 				AdminThreshold:      1,
 			},
-			err: ErrInvalidChangeThreshold(),
+			WantCheckErr: errors.ErrMsg,
 		},
 	}
 
-	db := store.MemStore()
-	for _, test := range testcases {
-		msg := test.msg
-		ctx, auth := newContextWithAuth(a)
-		handler := CreateContractMsgHandler{auth, NewContractBucket()}
+	auth := &weavetest.Auth{
+		Signer: weavetest.NewCondition(), // Any signer will do.
+	}
+	rt := app.NewRouter()
+	RegisterRoutes(rt, auth)
 
-		_, err := handler.Check(ctx, db, newTx(msg))
-		if test.err == nil {
-			require.NoError(t, err, test.name)
-		} else {
-			require.EqualError(t, err, test.err.Error(), test.name)
-		}
+	for testName, tc := range cases {
+		t.Run(testName, func(t *testing.T) {
+			db := store.MemStore()
+			migration.MustInitPkg(db, "multisig")
+			ctx := context.Background()
+			tx := &weavetest.Tx{Msg: tc.Msg}
 
-		res, err := handler.Deliver(ctx, db, newTx(msg))
-		if test.err == nil {
-			require.NoError(t, err, test.name)
-			contract := queryContract(t, db, handler.bucket, res.Data)
-			require.EqualValues(t,
-				Contract{msg.Sigs, msg.ActivationThreshold, msg.AdminThreshold},
-				contract,
-				test.name)
-		} else {
-			require.EqualError(t, err, test.err.Error(), test.name)
-		}
+			cache := db.CacheWrap()
+			if _, err := rt.Check(ctx, cache, tx); !tc.WantCheckErr.Is(err) {
+				t.Logf("want: %+v", tc.WantCheckErr)
+				t.Logf(" got: %+v", err)
+				t.Fatalf("check (%T)", tc.Msg)
+			}
+			cache.Discard()
+			if tc.WantCheckErr != nil {
+				// Failed checks are causing the message to be ignored.
+				return
+			}
 
+			if _, err := rt.Deliver(ctx, db, tx); !tc.WantDeliverErr.Is(err) {
+				t.Logf("want: %+v", tc.WantDeliverErr)
+				t.Logf(" got: %+v", err)
+				t.Fatalf("delivery (%T)", tc.Msg)
+			}
+		})
 	}
 }
 
-func TestUpdateContractMsgHandler(t *testing.T) {
-	db := store.MemStore()
+func TestUpdateContractHandler(t *testing.T) {
+	aliceCond := weavetest.NewCondition()
+	alice := aliceCond.Address()
+	bobbyCond := weavetest.NewCondition()
+	bobby := bobbyCond.Address()
+	cindyCond := weavetest.NewCondition()
+	cindy := cindyCond.Address()
 
-	// addresses controlling contract
-	_, a := helpers.MakeKey()
-	_, b := helpers.MakeKey()
-	_, c := helpers.MakeKey()
-	_, d := helpers.MakeKey()
-	_, e := helpers.MakeKey()
-
-	mutableID := withContract(t, db,
-		CreateContractMsg{
-			Sigs:                newSigs(a, b, c),
-			ActivationThreshold: 1,
-			AdminThreshold:      2,
-		})
-
-	immutableID := withContract(t, db,
-		CreateContractMsg{
-			Sigs:                newSigs(a, b, c),
-			ActivationThreshold: 1,
-			AdminThreshold:      4,
-		})
-
-	testcases := []struct {
-		name    string
-		msg     *UpdateContractMsg
-		signers []weave.Condition
-		err     error
+	cases := map[string]struct {
+		Msg            weave.Msg
+		Conditions     []weave.Condition
+		WantCheckErr   *errors.Error
+		WantDeliverErr *errors.Error
 	}{
-		{
-			name: "authorized",
-			msg: &UpdateContractMsg{
-				Id:                  mutableID,
-				Sigs:                newSigs(a, b, c, d, e),
-				ActivationThreshold: 4,
-				AdminThreshold:      5,
+		"successfully update a contract": {
+			Conditions: []weave.Condition{
+				cindyCond,
 			},
-			signers: []weave.Condition{a, b},
-			err:     nil,
-		},
-		{
-			name: "unauthorised",
-			msg: &UpdateContractMsg{
-				Id:                  mutableID,
-				Sigs:                newSigs(a, b, c, d, e),
-				ActivationThreshold: 4,
-				AdminThreshold:      5,
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 2,
+				AdminThreshold:      3,
 			},
-			signers: []weave.Condition{a},
-			err:     ErrUnauthorizedMultiSig(mutableID),
 		},
-		{
-			name: "immutable",
-			msg: &UpdateContractMsg{
-				Id:                  immutableID,
-				Sigs:                newSigs(a, b, c, d, e),
-				ActivationThreshold: 4,
-				AdminThreshold:      5,
+		"successfully update a contract with combined signature power": {
+			Conditions: []weave.Condition{
+				// Together they provide power 3 which is
+				// enough to run admin functionalities.
+				aliceCond,
+				bobbyCond,
 			},
-			signers: []weave.Condition{a, b, c, d, e},
-			err:     ErrUnauthorizedMultiSig(immutableID),
-		},
-		{
-			name: "bad change threshold",
-			msg: &UpdateContractMsg{
-				Id:                  mutableID,
-				Sigs:                newSigs(a, b, c, d, e),
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
 				ActivationThreshold: 1,
-				AdminThreshold:      0,
+				AdminThreshold:      1,
 			},
-			signers: []weave.Condition{a, b, c, d, e},
-			err:     ErrInvalidChangeThreshold(),
+		},
+		"cannot update a contract without participants": {
+			Conditions: []weave.Condition{
+				cindyCond,
+			},
+			Msg: &UpdateMsg{
+				Metadata:            &weave.Metadata{Schema: 1},
+				ContractID:          weavetest.SequenceID(1),
+				Participants:        []*Participant{},
+				ActivationThreshold: 2,
+				AdminThreshold:      3,
+			},
+			WantCheckErr: errors.ErrMsg,
+		},
+		"cannot update if activation threshold is too high": {
+			Conditions: []weave.Condition{
+				cindyCond,
+			},
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 100,
+				AdminThreshold:      3,
+			},
+			WantCheckErr: errors.ErrMsg,
+		},
+		"can update if admin threshold is higher than total participants power": {
+			Conditions: []weave.Condition{
+				cindyCond,
+			},
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 1,
+				AdminThreshold:      maxWeightValue,
+			},
+		},
+		"cannot update if activation threshold is higher than admin threshold": {
+			Conditions: []weave.Condition{
+				cindyCond,
+			},
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 2, Signature: alice},
+					{Weight: 2, Signature: bobby},
+				},
+				ActivationThreshold: 2,
+				AdminThreshold:      1,
+			},
+			WantCheckErr: errors.ErrMsg,
+		},
+		"admin power is required to update a contract": {
+			Conditions: []weave.Condition{
+				// Bobby is only power 2 and power 3 is required.
+				bobbyCond,
+			},
+			Msg: &UpdateMsg{
+				Metadata:   &weave.Metadata{Schema: 1},
+				ContractID: weavetest.SequenceID(1),
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 2,
+				AdminThreshold:      2,
+			},
+			WantCheckErr: errors.ErrUnauthorized,
 		},
 	}
 
-	for _, test := range testcases {
-		msg := test.msg
-		ctx, auth := newContextWithAuth(test.signers...)
-		handler := UpdateContractMsgHandler{auth, NewContractBucket()}
+	auth := &weavetest.CtxAuth{Key: "auth"}
+	rt := app.NewRouter()
+	RegisterRoutes(rt, auth)
 
-		_, err := handler.Check(ctx, db, newTx(msg))
-		if test.err == nil {
-			require.NoError(t, err, test.name)
-		} else {
-			require.EqualError(t, err, test.err.Error(), test.name)
-		}
+	for testName, tc := range cases {
+		t.Run(testName, func(t *testing.T) {
+			db := store.MemStore()
+			migration.MustInitPkg(db, "multisig")
 
-		_, err = handler.Deliver(ctx, db, newTx(msg))
-		if test.err == nil {
-			require.NoError(t, err, test.name)
-			contract := queryContract(t, db, handler.bucket, msg.Id)
-			require.EqualValues(t,
-				Contract{msg.Sigs, msg.ActivationThreshold, msg.AdminThreshold},
-				contract,
-				test.name)
-		} else {
-			require.EqualError(t, err, test.err.Error(), test.name)
-		}
+			ctx := context.Background()
+			ctx = auth.SetConditions(ctx, tc.Conditions...)
+			tx := &weavetest.Tx{Msg: tc.Msg}
+
+			b := NewContractBucket()
+
+			key, err := contractSeq.NextVal(db)
+			if err != nil {
+				t.Fatalf("cannot acquire ID: %s", err)
+			}
+			_, err = b.Put(db, key, &Contract{
+				Metadata: &weave.Metadata{Schema: 1},
+				Participants: []*Participant{
+					{Weight: 1, Signature: alice},
+					{Weight: 2, Signature: bobby},
+					{Weight: 3, Signature: cindy},
+				},
+				ActivationThreshold: 2,
+				AdminThreshold:      3,
+				Address:             MultiSigCondition(key).Address(),
+			})
+			assert.Nil(t, err)
+
+			cache := db.CacheWrap()
+			if _, err := rt.Check(ctx, cache, tx); !tc.WantCheckErr.Is(err) {
+				t.Logf("want: %+v", tc.WantCheckErr)
+				t.Logf(" got: %+v", err)
+				t.Fatalf("check (%T)", tc.Msg)
+			}
+			cache.Discard()
+			if tc.WantCheckErr != nil {
+				// Failed checks are causing the message to be ignored.
+				return
+			}
+
+			if _, err := rt.Deliver(ctx, db, tx); !tc.WantDeliverErr.Is(err) {
+				t.Logf("want: %+v", tc.WantDeliverErr)
+				t.Logf(" got: %+v", err)
+				t.Fatalf("delivery (%T)", tc.Msg)
+			}
+		})
 	}
 }

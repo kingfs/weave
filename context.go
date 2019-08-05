@@ -26,9 +26,11 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"time"
 
-	abci "github.com/tendermint/abci/types"
-	"github.com/tendermint/tmlibs/log"
+	"github.com/iov-one/weave/errors"
+	abci "github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
 type contextKey int // local to the weave module
@@ -38,6 +40,8 @@ const (
 	contextKeyHeight
 	contextKeyChainID
 	contextKeyLogger
+	contextKeyTime
+	contextCommitInfo
 )
 
 var (
@@ -69,6 +73,22 @@ func GetHeader(ctx Context) (abci.Header, bool) {
 	return val, ok
 }
 
+// WithCommitInfo sets the info on who signed the block in this Context.
+// Panics if already set.
+func WithCommitInfo(ctx Context, info CommitInfo) Context {
+	if _, ok := GetCommitInfo(ctx); ok {
+		panic("CommitInfo already set")
+	}
+	return context.WithValue(ctx, contextCommitInfo, info)
+}
+
+// GetCommitInfo returns the info on validators that signed
+// this block. Returns false if not present.
+func GetCommitInfo(ctx Context) (CommitInfo, bool) {
+	val, ok := ctx.Value(contextCommitInfo).(CommitInfo)
+	return val, ok
+}
+
 // WithHeight sets the block height for the Context.
 // panics if called with height already set
 func WithHeight(ctx Context, height int64) Context {
@@ -83,6 +103,29 @@ func WithHeight(ctx Context, height int64) Context {
 func GetHeight(ctx Context) (int64, bool) {
 	val, ok := ctx.Value(contextKeyHeight).(int64)
 	return val, ok
+}
+
+// WithBlockTime sets the block time for the context. Block time is always
+// represented in UTC.
+func WithBlockTime(ctx Context, t time.Time) Context {
+	return context.WithValue(ctx, contextKeyTime, t.UTC())
+}
+
+// BlockTime returns current block wall clock time as declared in the context.
+// An error is returned if a block time is not present in the context or if the
+// zero time value is found.
+func BlockTime(ctx Context) (time.Time, error) {
+	val, ok := ctx.Value(contextKeyTime).(time.Time)
+	if !ok {
+		return time.Time{}, errors.Wrap(errors.ErrHuman, "block time not present in the context")
+	}
+	if val.IsZero() {
+		// This is a special case when a zero time value was attached
+		// to the context. Even though it is present it is not a valid
+		// value.
+		return val, errors.Wrap(errors.ErrHuman, "zero value block time in the context")
+	}
+	return val, nil
 }
 
 // WithChainID sets the chain id for the Context.
@@ -100,6 +143,9 @@ func WithChainID(ctx Context, chainID string) Context {
 // GetChainID returns the current chain id
 // panics if chain id not already set (should never happen)
 func GetChainID(ctx Context) string {
+	if x := ctx.Value(contextKeyChainID); x == nil {
+		panic("Chain id is not in context")
+	}
 	return ctx.Value(contextKeyChainID).(string)
 }
 

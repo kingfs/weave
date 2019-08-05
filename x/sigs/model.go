@@ -3,8 +3,14 @@ package sigs
 import (
 	"github.com/iov-one/weave"
 	"github.com/iov-one/weave/crypto"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/orm"
 )
+
+func init() {
+	migration.MustRegister(1, &UserData{}, migration.NoModification)
+}
 
 // BucketName is where we store the accounts
 const BucketName = "sigs"
@@ -15,47 +21,60 @@ const BucketName = "sigs"
 
 var _ orm.CloneableData = (*UserData)(nil)
 
-// Validate requires that all coins are in alphabetical
 func (u *UserData) Validate() error {
-	seq := u.Sequence
-	if seq < 0 {
-		return ErrInvalidSequence("Seq(%d)", seq)
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", u.Metadata.Validate())
+	if seq := u.Sequence; seq < 0 {
+		errs = errors.AppendField(errs, "Sequence", ErrInvalidSequence)
+	} else if seq > 0 && u.Pubkey == nil {
+		errs = errors.Append(errs, errors.Field("Sequence", ErrInvalidSequence, "needs Pubkey"))
 	}
-	if seq > 0 && u.PubKey == nil {
-		return ErrInvalidSequence("Seq(%d) needs PubKey", seq)
-	}
-	return nil
+	return errs
 }
 
 // Copy makes a new UserData with the same coins
 func (u *UserData) Copy() orm.CloneableData {
 	return &UserData{
+		Metadata: u.Metadata.Copy(),
 		Sequence: u.Sequence,
-		PubKey:   u.PubKey,
+		Pubkey:   u.Pubkey,
 	}
 }
 
-// CheckAndIncrementSequence checks if the current Sequence
-// matches the expected value.
-// If so, it will increase the sequence by one and return nil
-// If not, it will not change the sequence, but return an error
-func (u *UserData) CheckAndIncrementSequence(check int64) error {
-	if u.Sequence != check {
-		return ErrInvalidSequence("Mismatch %d != %d", check, u.Sequence)
+// CheckAndIncrementSequence implements check and increment operation.
+// If current sequence value is the same as given expected value then it is
+// incremented. Otherwise an error is returned.
+// Before incrementing the sequence, this function is testing for a value
+// overflow.
+func (u *UserData) CheckAndIncrementSequence(expected int64) error {
+	if u.Sequence != expected {
+		return errors.Wrapf(ErrInvalidSequence, "mismatch expected %d, got %d", expected, u.Sequence)
 	}
-	u.Sequence++
+
+	next := u.Sequence + 1
+
+	// maxSequenceValue is limited by the client. The greatest supported
+	// nonce value at client side is
+	//   Number.MAX_SAFE_INTEGER = 9007199254740991 = 2^53 −  1
+	// If greater values must be supported, we get much more complicated
+	// client code.
+	const maxSequenceValue = (1 << 53) - 1
+	if next <= 0 || next > maxSequenceValue {
+		return errors.Wrap(errors.ErrOverflow, "sequence out of range")
+	}
+	u.Sequence = next
 	return nil
 }
 
-// SetPubKey will try to set the PubKey or panic on an illegal operation.
+// SetPubkey will try to set the Pubkey or panic on an illegal operation.
 // It is illegal to reset an already set key
 // Otherwise, we don't control
 // (although we could verify the hash, we leave that to the controller)
-func (u *UserData) SetPubKey(pubKey *crypto.PublicKey) {
-	if u.PubKey != nil {
+func (u *UserData) SetPubkey(pubkey *crypto.PublicKey) {
+	if u.Pubkey != nil {
 		panic("Cannot change pubkey for a user")
 	}
-	u.PubKey = pubKey
+	u.Pubkey = pubkey
 }
 
 //-------------------- Object Wrapper -------
@@ -69,16 +88,17 @@ func AsUser(obj orm.Object) *UserData {
 }
 
 // NewUser constructs an object from an address and pubkey
-func NewUser(pubKey *crypto.PublicKey) orm.Object {
+func NewUser(pubkey *crypto.PublicKey) orm.Object {
 	var key weave.Address
-	value := &UserData{PubKey: pubKey}
-	if pubKey != nil {
-		key = pubKey.Address()
+	value := &UserData{
+		Metadata: &weave.Metadata{Schema: 1},
+		Pubkey:   pubkey,
+	}
+	if pubkey != nil {
+		key = pubkey.Address()
 	}
 	return orm.NewSimpleObj(key, value)
 }
-
-//------------------ High-Level ------------------------
 
 // Bucket extends orm.Bucket with GetOrCreate
 type Bucket struct {
@@ -88,17 +108,15 @@ type Bucket struct {
 // NewBucket creates the proper bucket for this extension
 func NewBucket() Bucket {
 	return Bucket{
-		Bucket: orm.NewBucket(BucketName, NewUser(nil)),
+		Bucket: migration.NewBucket("sigs", BucketName, NewUser(nil)),
 	}
 }
 
 // GetOrCreate initializes a UserData if none exist for that key
-func (b Bucket) GetOrCreate(db weave.KVStore,
-	pubKey *crypto.PublicKey) (orm.Object, error) {
-
-	obj, err := b.Get(db, pubKey.Address())
+func (b Bucket) GetOrCreate(db weave.KVStore, pubkey *crypto.PublicKey) (orm.Object, error) {
+	obj, err := b.Get(db, pubkey.Address())
 	if err == nil && obj == nil {
-		obj = NewUser(pubKey)
+		obj = NewUser(pubkey)
 	}
 	return obj, err
 }

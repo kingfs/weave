@@ -1,16 +1,14 @@
 package app
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
 
-	abci "github.com/tendermint/abci/types"
-	"github.com/tendermint/tmlibs/log"
-
 	"github.com/iov-one/weave"
 	"github.com/iov-one/weave/errors"
+	abci "github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
 // StoreApp contains a data store and all info needed
@@ -20,7 +18,7 @@ import (
 // DeliverTx and initializing state from the genesis.
 // Errors on ABCI steps handled as panics
 // I'm sorry Alex, but there is no other way :(
-// https://github.com/tendermint/abci/issues/165#issuecomment-353704015
+// https://github.com/tendermint/tendermint/abci/issues/165#issuecomment-353704015
 // "Regarding errors in general, for messages that don't take
 //  user input like Flush, Info, InitChain, BeginBlock, EndBlock,
 // and Commit.... There is no way to handle these errors gracefully,
@@ -32,7 +30,7 @@ type StoreApp struct {
 	name string
 
 	// Database state (committed, check, deliver....)
-	store *commitStore
+	store *CommitStore
 
 	// Code to initialize from a genesis file
 	initializer weave.Initializer
@@ -45,7 +43,7 @@ type StoreApp struct {
 	chainID string
 
 	// cached validator changes from DeliverTx
-	pending []abci.Validator
+	pending weave.ValidatorUpdates
 
 	// baseContext contains context info that is valid for
 	// lifetime of this app (eg. chainID)
@@ -54,10 +52,6 @@ type StoreApp struct {
 	// blockContext contains context info that is valid for the
 	// current block (eg. height, header), reset on BeginBlock
 	blockContext weave.Context
-
-	// genesisFile (temporary) is used to store the file
-	// to read from on InitChain
-	genesisFile string
 }
 
 // NewStoreApp initializes this app into a ready state with some defaults
@@ -69,21 +63,24 @@ func NewStoreApp(name string, store weave.CommitKVStore,
 	s := &StoreApp{
 		name: name,
 		// note: panics if trouble initializing from store
-		store:       newCommitStore(store),
+		store:       NewCommitStore(store),
 		queryRouter: queryRouter,
 		baseContext: baseContext,
 	}
 	s = s.WithLogger(log.NewNopLogger())
 
 	// load the chainID from the db
-	s.chainID = loadChainID(s.DeliverStore())
+	s.chainID = mustLoadChainID(s.DeliverStore())
 	if s.chainID != "" {
 		s.baseContext = weave.WithChainID(s.baseContext, s.chainID)
 	}
 
 	// get the most recent height
-	height, _ := s.store.CommitInfo()
-	s.blockContext = weave.WithHeight(s.baseContext, height)
+	info, err := s.store.CommitInfo()
+	if err != nil {
+		panic(err)
+	}
+	s.blockContext = weave.WithHeight(s.baseContext, info.Version)
 	return s
 }
 
@@ -100,7 +97,7 @@ func (s *StoreApp) WithInit(init weave.Initializer) *StoreApp {
 
 // parseAppState is called from InitChain, the first time the chain
 // starts, and not on restarts.
-func (s *StoreApp) parseAppState(data []byte, chainID string, init weave.Initializer) error {
+func (s *StoreApp) parseAppState(data []byte, params weave.GenesisParams, chainID string, init weave.Initializer) error {
 	if s.chainID != "" {
 		return fmt.Errorf("appState previously loaded for chain: %s", s.chainID)
 	}
@@ -112,7 +109,7 @@ func (s *StoreApp) parseAppState(data []byte, chainID string, init weave.Initial
 	var appState weave.Options
 	err := json.Unmarshal(data, &appState)
 	if err != nil {
-		return errors.WithCode(err, errors.CodeTxParseError)
+		return errors.Wrap(errors.ErrState, err.Error())
 	}
 
 	err = s.storeChainID(chainID)
@@ -120,13 +117,13 @@ func (s *StoreApp) parseAppState(data []byte, chainID string, init weave.Initial
 		return err
 	}
 
-	return init.FromGenesis(appState, s.DeliverStore())
+	return init.FromGenesis(appState, params, s.DeliverStore())
 }
 
 // store chainID and update context
-func (s *StoreApp) storeChainID(chainId string) error {
+func (s *StoreApp) storeChainID(chainID string) error {
 	// set the chainID
-	s.chainID = chainId
+	s.chainID = chainID
 	err := saveChainID(s.DeliverStore(), s.chainID)
 	if err != nil {
 		return err
@@ -174,16 +171,20 @@ func (s *StoreApp) CheckStore() weave.CacheableKVStore {
 //
 // The height is the block that holds the transactions, not the apphash itself.
 func (s *StoreApp) Info(req abci.RequestInfo) abci.ResponseInfo {
-	height, hash := s.store.CommitInfo()
+	info, err := s.store.CommitInfo()
+	if err != nil {
+		// sorry, nothing else we can return to server
+		panic(err)
+	}
 
 	s.logger.Info("Info synced",
-		"height", height,
-		"hash", fmt.Sprintf("%X", hash))
+		"height", info.Version,
+		"hash", fmt.Sprintf("%X", info.Hash))
 
 	return abci.ResponseInfo{
 		Data:             s.name,
-		LastBlockHeight:  height,
-		LastBlockAppHash: hash,
+		LastBlockHeight:  info.Version,
+		LastBlockAppHash: info.Hash,
 	}
 }
 
@@ -197,7 +198,7 @@ func (s *StoreApp) SetOption(res abci.RequestSetOption) abci.ResponseSetOption {
 Query gets data from the app store.
 A query request has the following elements:
 * Path - the type of query
-* Data - what to query, interpretted based on Path
+* Data - what to query, interpreted based on Path
 * Height - the block height to query (if 0 most recent)
 * Prove - if true, also return a proof
 
@@ -216,7 +217,8 @@ func (s *StoreApp) Query(reqQuery abci.RequestQuery) (resQuery abci.ResponseQuer
 	path, mod := splitPath(reqQuery.Path)
 	qh := s.queryRouter.Handler(path)
 	if qh == nil {
-		resQuery.Code = errors.CodeUnknownRequest
+		code, _ := errors.ABCIInfo(errors.ErrNotFound, false)
+		resQuery.Code = code
 		resQuery.Log = fmt.Sprintf("Unexpected Query path: %v", reqQuery.Path)
 		return
 	}
@@ -231,8 +233,11 @@ func (s *StoreApp) Query(reqQuery abci.RequestQuery) (resQuery abci.ResponseQuer
 	// 		height = s.CommittedHeight()
 	// 	}
 	// }
-	height, _ := s.store.CommitInfo()
-	resQuery.Height = height
+	info, err := s.store.CommitInfo()
+	if err != nil {
+		return queryError(err)
+	}
+	resQuery.Height = info.Version
 	// TODO: better version handling!
 	db := s.store.committed.CacheWrap()
 
@@ -278,15 +283,20 @@ func splitPath(path string) (string, string) {
 }
 
 func queryError(err error) abci.ResponseQuery {
+	code, log := errors.ABCIInfo(err, false)
 	return abci.ResponseQuery{
-		Log:  err.Error(),
-		Code: errors.CodeInternalErr,
+		Log:  log,
+		Code: code,
 	}
 }
 
 // Commit implements abci.Application
 func (s *StoreApp) Commit() (res abci.ResponseCommit) {
-	commitID := s.store.Commit()
+	commitID, err := s.store.Commit()
+	if err != nil {
+		// abci interface doesn't allow returning errors here, so just die
+		panic(err)
+	}
 
 	s.logger.Debug("Commit synced",
 		"height", commitID.Version,
@@ -297,12 +307,11 @@ func (s *StoreApp) Commit() (res abci.ResponseCommit) {
 }
 
 // InitChain implements ABCI
-// TODO: store the original validators somewhere
 // Note: in tendermint 0.17, the genesis file is passed
 // in here, we should use this to trigger reading the genesis now
 // TODO: investigate validators and consensusParams in response
 func (s *StoreApp) InitChain(req abci.RequestInitChain) (res abci.ResponseInitChain) {
-	err := s.parseAppState(req.AppStateBytes, req.ChainId, s.initializer)
+	err := s.parseAppState(req.AppStateBytes, weave.FromInitChain(req), req.ChainId, s.initializer)
 	if err != nil {
 		// Read comment on type header
 		panic(err)
@@ -318,40 +327,30 @@ func (s *StoreApp) BeginBlock(req abci.RequestBeginBlock) (res abci.ResponseBegi
 	// set the begin block context
 	ctx := weave.WithHeader(s.baseContext, req.Header)
 	ctx = weave.WithHeight(ctx, req.Header.GetHeight())
-	s.blockContext = ctx
+	ctx = weave.WithCommitInfo(ctx, req.LastCommitInfo)
 
-	return
+	now := req.Header.GetTime()
+	if now.IsZero() {
+		panic("current time not found in the block header")
+	}
+	ctx = weave.WithBlockTime(ctx, now)
+	s.blockContext = ctx
+	return res
 }
 
 // EndBlock - ABCI
 // Returns a list of all validator changes made in this block
 // TODO: investigate response tags as of 0.11 abci
 func (s *StoreApp) EndBlock(_ abci.RequestEndBlock) (res abci.ResponseEndBlock) {
-	res.ValidatorUpdates = s.pending
-	s.pending = nil
+	res.ValidatorUpdates = weave.ValidatorUpdatesToABCI(s.pending)
+	s.pending = weave.ValidatorUpdates{}
 	return
 }
 
 // AddValChange is meant to be called by apps on DeliverTx
 // results, this is added to the cache for the endblock changeset
-func (s *StoreApp) AddValChange(diffs []abci.Validator) {
+func (s *StoreApp) AddValChange(diffs []weave.ValidatorUpdate) {
+	s.pending.ValidatorUpdates = append(s.pending.ValidatorUpdates, diffs...)
 	// ensures multiple updates for one validator are combined into one slot
-	for _, d := range diffs {
-		idx := pubKeyIndex(d, s.pending)
-		if idx >= 0 {
-			s.pending[idx] = d
-		} else {
-			s.pending = append(s.pending, d)
-		}
-	}
-}
-
-// return index of list with validator of same PubKey, or -1 if no match
-func pubKeyIndex(val abci.Validator, list []abci.Validator) int {
-	for i, v := range list {
-		if val.PubKey.Type == v.PubKey.Type && bytes.Equal(val.PubKey.Data, v.PubKey.Data) {
-			return i
-		}
-	}
-	return -1
+	s.pending = s.pending.Deduplicate(false)
 }

@@ -2,8 +2,9 @@ package orm
 
 import (
 	"bytes"
-	"errors"
+
 	"github.com/iov-one/weave"
+	"github.com/iov-one/weave/errors"
 )
 
 var indPrefix = []byte("_i.")
@@ -68,7 +69,7 @@ func asMultiKeyIndexer(indexer Indexer) MultiKeyIndexer {
 
 // IndexKey is the full key we store in the db, including prefix
 // We copy into a new array rather than use append, as we don't
-// want consequetive calls to overwrite the same byte array.
+// want consecutive calls to overwrite the same byte array.
 func (i Index) IndexKey(key []byte) []byte {
 	l := len(i.id)
 	out := make([]byte, l+len(key))
@@ -92,7 +93,7 @@ func (i Index) Update(db weave.KVStore, prev Object, save Object) error {
 	sw := s{prev == nil, save == nil}
 	switch sw {
 	case s{true, true}:
-		return ErrUpdateNil()
+		return errors.Wrap(errors.ErrHuman, "update requires at least one non-nil object")
 	case s{true, false}:
 		keys, err := i.index(save)
 		if err != nil {
@@ -118,7 +119,7 @@ func (i Index) Update(db weave.KVStore, prev Object, save Object) error {
 	case s{false, false}:
 		return i.move(db, prev, save)
 	}
-	return ErrBoolean()
+	return errors.Wrap(errors.ErrHuman, "you have violated the rules of boolean logic")
 }
 
 // GetLike calculates the index for the given pattern, and
@@ -156,7 +157,10 @@ func deduplicate(s [][]byte) [][]byte {
 // GetAt returns a list of all pk at that index (may be empty), or an error
 func (i Index) GetAt(db weave.ReadOnlyKVStore, index []byte) ([][]byte, error) {
 	key := i.IndexKey(index)
-	val := db.Get(key)
+	val, err := db.Get(key)
+	if err != nil {
+		return nil, err
+	}
 	if val == nil {
 		return nil, nil
 	}
@@ -164,7 +168,7 @@ func (i Index) GetAt(db weave.ReadOnlyKVStore, index []byte) ([][]byte, error) {
 		return [][]byte{val}, nil
 	}
 	var data = new(MultiRef)
-	err := data.Unmarshal(val)
+	err = data.Unmarshal(val)
 	if err != nil {
 		return nil, err
 	}
@@ -175,22 +179,30 @@ func (i Index) GetAt(db weave.ReadOnlyKVStore, index []byte) ([][]byte, error) {
 // begins with a given prefix
 func (i Index) GetPrefix(db weave.ReadOnlyKVStore, prefix []byte) ([][]byte, error) {
 	dbPrefix := i.IndexKey(prefix)
-	itr := db.Iterator(prefixRange(dbPrefix))
-	var data [][]byte
+	itr, err := db.Iterator(prefixRange(dbPrefix))
+	if err != nil {
+		return nil, err
+	}
+	defer itr.Release()
 
-	for ; itr.Valid(); itr.Next() {
+	var data [][]byte
+	_, value, err := itr.Next()
+	for err == nil {
 		if i.unique {
-			data = append(data, itr.Value())
+			data = append(data, value)
 		} else {
 			tmp := new(MultiRef)
-			err := tmp.Unmarshal(itr.Value())
+			err := tmp.Unmarshal(value)
 			if err != nil {
 				return nil, err
 			}
 			data = append(data, tmp.Refs...)
 		}
+		_, value, err = itr.Next()
 	}
-
+	if !errors.ErrIteratorDone.Is(err) {
+		return nil, err
+	}
 	return data, nil
 }
 
@@ -204,39 +216,43 @@ func (i Index) Query(db weave.ReadOnlyKVStore, mod string,
 		if err != nil {
 			return nil, err
 		}
-		return i.loadRefs(db, refs), nil
+		return i.loadRefs(db, refs)
 	case weave.PrefixQueryMod:
 		refs, err := i.GetPrefix(db, data)
 		if err != nil {
 			return nil, err
 		}
-		return i.loadRefs(db, refs), nil
+		return i.loadRefs(db, refs)
 	default:
-		return nil, errors.New("no implemented: " + mod)
+		return nil, errors.Wrap(errors.ErrHuman, "not implemented: "+mod)
 	}
 }
 
 func (i Index) loadRefs(db weave.ReadOnlyKVStore,
-	refs [][]byte) []weave.Model {
+	refs [][]byte) ([]weave.Model, error) {
 
 	if len(refs) == 0 {
-		return nil
+		return nil, nil
 	}
 	res := make([]weave.Model, len(refs))
 	for j, ref := range refs {
 		key := i.refKey(ref)
+		value, err := db.Get(key)
+		if err != nil {
+			return nil, err
+		}
 		res[j] = weave.Model{
 			Key:   key,
-			Value: db.Get(key),
+			Value: value,
 		}
 	}
-	return res
+	return res, nil
 }
 
 func (i Index) move(db weave.KVStore, prev Object, save Object) error {
 	// if the primary key is not equal, we have a problem
 	if !bytes.Equal(prev.Key(), save.Key()) {
-		return ErrModifiedPK()
+		return errors.Wrap(errors.ErrImmutable, "cannot modify the primary key of an object")
 	}
 
 	oldKeys, err := i.index(prev)
@@ -254,9 +270,12 @@ func (i Index) move(db weave.KVStore, prev Object, save Object) error {
 	for _, newKey := range keysToAdd {
 		if i.unique {
 			k := i.IndexKey(newKey)
-			val := db.Get(k)
+			val, err := db.Get(k)
+			if err != nil {
+				return err
+			}
 			if val != nil {
-				return ErrUniqueConstraint(i.name)
+				return errors.Wrap(errors.ErrDuplicate, i.name)
 			}
 		}
 	}
@@ -302,22 +321,24 @@ func (i Index) remove(db weave.KVStore, index []byte, pk []byte) error {
 	}
 
 	key := i.IndexKey(index)
-	cur := db.Get(key)
+	cur, err := db.Get(key)
+	if err != nil {
+		return err
+	}
 	if cur == nil {
-		return ErrRemoveUnregistered()
+		return errors.Wrap(errors.ErrNotFound, "cannot remove index from nothing")
 	}
 	if i.unique {
 		// if something else was here, don't delete
 		if !bytes.Equal(cur, pk) {
-			return ErrRemoveUnregistered()
+			return errors.Wrap(errors.ErrNotFound, "cannot remove index from invalid object")
 		}
-		db.Delete(key)
-		return nil
+		return db.Delete(key)
 	}
 
 	// otherwise, remove one from a list....
 	var data = new(MultiRef)
-	err := data.Unmarshal(cur)
+	err = data.Unmarshal(cur)
 	if err != nil {
 		return err
 	}
@@ -327,16 +348,15 @@ func (i Index) remove(db weave.KVStore, index []byte, pk []byte) error {
 	}
 	// nothing left, delete this key
 	if data.Size() == 0 {
-		db.Delete(key)
-		return nil
+		return db.Delete(key)
 	}
 	// other left, just update state
 	save, err := data.Marshal()
 	if err != nil {
 		return err
 	}
-	db.Set(key, save)
-	return nil
+
+	return db.Set(key, save)
 }
 
 func (i Index) insert(db weave.KVStore, index []byte, pk []byte) error {
@@ -346,14 +366,17 @@ func (i Index) insert(db weave.KVStore, index []byte, pk []byte) error {
 	}
 
 	key := i.IndexKey(index)
-	cur := db.Get(key)
+	cur, err := db.Get(key)
+	if err != nil {
+		return err
+	}
 
 	if i.unique {
 		if cur != nil {
-			return ErrUniqueConstraint(i.name)
+			return errors.Wrap(errors.ErrDuplicate, i.name)
 		}
-		db.Set(key, pk)
-		return nil
+
+		return db.Set(key, pk)
 	}
 
 	// otherwise, add one to a list....
@@ -364,7 +387,7 @@ func (i Index) insert(db weave.KVStore, index []byte, pk []byte) error {
 			return err
 		}
 	}
-	err := data.Add(pk)
+	err = data.Add(pk)
 	if err != nil {
 		return err
 	}
@@ -374,6 +397,6 @@ func (i Index) insert(db weave.KVStore, index []byte, pk []byte) error {
 	if err != nil {
 		return err
 	}
-	db.Set(key, save)
-	return nil
+
+	return db.Set(key, save)
 }

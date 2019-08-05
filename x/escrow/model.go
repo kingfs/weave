@@ -1,59 +1,50 @@
 package escrow
 
 import (
-	"errors"
-
 	"github.com/iov-one/weave"
+	coin "github.com/iov-one/weave/coin"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/migration"
 	"github.com/iov-one/weave/orm"
-	"github.com/iov-one/weave/x"
 )
 
-const (
-	// BucketName is where we store the escrows
-	BucketName = "esc"
-	// SequenceName is an auto-increment ID counter for escrows
-	SequenceName = "id"
-)
+func init() {
+	migration.MustRegister(1, &Escrow{}, migration.NoModification)
+}
 
 var _ orm.CloneableData = (*Escrow)(nil)
 
 // Validate ensures the escrow is valid
 func (e *Escrow) Validate() error {
-	if e.Sender == nil {
-		return ErrMissingSender()
+	var errs error
+	errs = errors.AppendField(errs, "Metadata", e.Metadata.Validate())
+	errs = errors.AppendField(errs, "Source", e.Source.Validate())
+	errs = errors.AppendField(errs, "Arbiter", e.Arbiter.Validate())
+	errs = errors.AppendField(errs, "Destination", e.Destination.Validate())
+	errs = errors.AppendField(errs, "Address", e.Address.Validate())
+	if e.Timeout == 0 {
+		// Zero timeout is a valid value that dates to 1970-01-01. We
+		// know that this value is in the past and makes no sense. Most
+		// likely value was not provided and a zero value remained.
+		errs = errors.Append(errs, errors.Field("Timeout", errors.ErrInput, "required"))
 	}
-	// Copied from CreateEscrowMsg.Validate
-	// TODO: code reuse???
-	if e.Arbiter == nil {
-		return ErrMissingArbiter()
-	}
-	if e.Recipient == nil {
-		return ErrMissingRecipient()
-	}
-	if e.Timeout <= 0 {
-		return ErrInvalidTimeout(e.Timeout)
-	}
+	errs = errors.AppendField(errs, "Timeout", e.Timeout.Validate())
 	if len(e.Memo) > maxMemoSize {
-		return ErrInvalidMemo(e.Memo)
+		errs = errors.Append(errs, errors.Field("Memo", errors.ErrInput, "cannot be longer than %d", maxMemoSize))
 	}
-	if err := validateAmount(e.Amount); err != nil {
-		return err
-	}
-	if err := validateConditions(e.Arbiter); err != nil {
-		return err
-	}
-	return validateAddresses(e.Sender, e.Recipient)
+	return errs
 }
 
 // Copy makes a new set with the same coins
 func (e *Escrow) Copy() orm.CloneableData {
 	return &Escrow{
-		Sender:    e.Sender,
-		Arbiter:   e.Arbiter,
-		Recipient: e.Recipient,
-		Amount:    e.Amount,
-		Timeout:   e.Timeout,
-		Memo:      e.Memo,
+		Metadata:    e.Metadata.Copy(),
+		Source:      e.Source,
+		Arbiter:     e.Arbiter,
+		Destination: e.Destination,
+		Timeout:     e.Timeout,
+		Memo:        e.Memo,
+		Address:     e.Address.Clone(),
 	}
 }
 
@@ -68,15 +59,23 @@ func AsEscrow(obj orm.Object) *Escrow {
 }
 
 // NewEscrow creates an escrow orm.Object
-func NewEscrow(id []byte, sender, rcpt weave.Address, arb weave.Condition,
-	amount x.Coins, timeout int64, memo string) orm.Object {
+func NewEscrow(
+	id []byte,
+	source weave.Address,
+	destination weave.Address,
+	arbiter weave.Address,
+	amount coin.Coins,
+	timeout weave.UnixTime,
+	memo string,
+) orm.Object {
 	esc := &Escrow{
-		Sender:    sender,
-		Arbiter:   arb,
-		Recipient: rcpt,
-		Amount:    amount,
-		Timeout:   timeout,
-		Memo:      memo,
+		Metadata:    &weave.Metadata{Schema: 1},
+		Source:      source,
+		Arbiter:     arbiter,
+		Destination: destination,
+		Timeout:     timeout,
+		Memo:        memo,
+		Address:     Condition(id).Address(),
 	}
 	return orm.NewSimpleObj(id, esc)
 }
@@ -87,94 +86,49 @@ func Condition(key []byte) weave.Condition {
 	return weave.NewCondition("escrow", "seq", key)
 }
 
-// NewEscrow generates a new Escrow object
-// TODO: auto-generate sequence
-// func NewEscrow(ticker, name string, sigFigs int32) orm.Object {
-// 	value := &Escrow{
-// 		Name:    name,
-// 		SigFigs: sigFigs,
-// 	}
-// 	return orm.NewSimpleObj([]byte(ticker), value)
-// }
-
-//--- Bucket - handles escrows
-
-// Bucket is a type-safe wrapper around orm.Bucket
-type Bucket struct {
-	orm.Bucket
-	idSeq orm.Sequence
+func NewBucket() orm.ModelBucket {
+	b := orm.NewModelBucket("esc", &Escrow{},
+		orm.WithIDSequence(escrowSeq),
+		orm.WithIndex("source", idxSource, false),
+		orm.WithIndex("destination", idxDestination, false),
+		orm.WithIndex("arbiter", idxArbiter, false),
+	)
+	return migration.NewModelBucket("escrow", b)
 }
 
-// NewBucket initializes a Bucket with default name
-//
-// inherit Get and Save from orm.Bucket
-// add Create
-func NewBucket() Bucket {
-	bucket := orm.NewBucket(BucketName,
-		orm.NewSimpleObj(nil, new(Escrow))).
-		WithIndex("sender", idxSender, false).
-		WithIndex("recipient", idxRecipient, false).
-		WithIndex("arbiter", idxArbiter, false)
+var escrowSeq = orm.NewSequence("escrow", "id")
 
-	return Bucket{
-		Bucket: bucket,
-		idSeq:  bucket.Sequence(SequenceName),
-	}
-	// TODO: add indexes
-}
-
-func getEscrow(obj orm.Object) (*Escrow, error) {
+func toEscrow(obj orm.Object) (*Escrow, error) {
 	if obj == nil {
-		return nil, errors.New("Cannot take index of nil")
+		return nil, errors.Wrap(errors.ErrHuman, "Cannot take index of nil")
 	}
 	esc, ok := obj.Value().(*Escrow)
 	if !ok {
-		return nil, errors.New("Can only take index of Escrow")
+		return nil, errors.Wrap(errors.ErrHuman, "Can only take index of Escrow")
 	}
 	return esc, nil
 }
 
-func idxSender(obj orm.Object) ([]byte, error) {
-	esc, err := getEscrow(obj)
+func idxSource(obj orm.Object) ([]byte, error) {
+	esc, err := toEscrow(obj)
 	if err != nil {
 		return nil, err
 	}
-	return esc.Sender, nil
+	return esc.Source, nil
 }
 
-func idxRecipient(obj orm.Object) ([]byte, error) {
-	esc, err := getEscrow(obj)
+func idxDestination(obj orm.Object) ([]byte, error) {
+	esc, err := toEscrow(obj)
 	if err != nil {
 		return nil, err
 	}
-	return esc.Recipient, nil
+	return esc.Destination, nil
 }
 
 func idxArbiter(obj orm.Object) ([]byte, error) {
-	esc, err := getEscrow(obj)
+	esc, err := toEscrow(obj)
 	if err != nil {
 		return nil, err
 	}
 	return esc.Arbiter, nil
-}
-
-// Create will calculate the next sequence number and then
-// store the escrow there.
-// Saves the object and returns it (to inspect the ID)
-func (b Bucket) Create(db weave.KVStore, escrow *Escrow) (orm.Object, error) {
-	key := b.idSeq.NextVal(db)
-	obj := orm.NewSimpleObj(key, escrow)
-	err := b.Bucket.Save(db, obj)
-	if err != nil {
-		return nil, err
-	}
-	return obj, nil
-}
-
-// Save enforces the proper type
-func (b Bucket) Save(db weave.KVStore, obj orm.Object) error {
-	if _, ok := obj.Value().(*Escrow); !ok {
-		return orm.ErrInvalidObject(obj.Value())
-	}
-	return b.Bucket.Save(db, obj)
 }

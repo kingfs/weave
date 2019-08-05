@@ -1,325 +1,310 @@
 package escrow
 
 import (
-	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iov-one/weave"
-	"github.com/iov-one/weave/x"
-	"github.com/iov-one/weave/x/cash"
-	"github.com/stretchr/testify/assert"
+	"github.com/iov-one/weave/coin"
+	"github.com/iov-one/weave/errors"
+	"github.com/iov-one/weave/weavetest"
+	"github.com/iov-one/weave/weavetest/assert"
 )
 
 // mustCombineCoins has one return value for tests...
-func mustCombineCoins(cs ...x.Coin) x.Coins {
-	s, err := x.CombineCoins(cs...)
+func mustCombineCoins(cs ...coin.Coin) coin.Coins {
+	s, err := coin.CombineCoins(cs...)
 	if err != nil {
 		panic(err)
 	}
 	return s
 }
 
-type checkErr func(error) bool
-
-func noErr(err error) bool { return err == nil }
-
-func TestCreateEscrowMsg(t *testing.T) {
-	var helpers x.TestHelpers
-
+func TestCreateMsg(t *testing.T) {
 	// good
-	_, a := helpers.MakeKey()
-	_, b := helpers.MakeKey()
+	a := weavetest.NewCondition()
+	b := weavetest.NewCondition()
 	c := weave.NewCondition("monkey", "gelato", []byte("berry"))
-	// invalid
-	d := weave.Condition("foobar")
+
+	timeout := weave.AsUnixTime(time.Now())
 
 	// good
-	plus := mustCombineCoins(x.NewCoin(100, 0, "FOO"))
+	plus := mustCombineCoins(coin.NewCoin(100, 0, "FOO"))
 	// invalid
-	minus := mustCombineCoins(x.NewCoin(100, 0, "BAR"),
-		x.NewCoin(-20, 0, "FIT"))
-	mixed := x.Coins{{Whole: 100, Ticker: "bad"}}
+	minus := mustCombineCoins(coin.NewCoin(100, 0, "BAR"),
+		coin.NewCoin(-20, 0, "FIT"))
+	mixed := coin.Coins{{Whole: 100, Ticker: "bad"}}
 
-	cases := []struct {
-		msg   *CreateEscrowMsg
-		check checkErr
+	cases := map[string]struct {
+		msg   *CreateMsg
+		check error
 	}{
-		// nothing
-		0: {new(CreateEscrowMsg), IsMissingConditionErr},
-		// proper
-		1: {
-			&CreateEscrowMsg{
-				Sender:    a.Address(),
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Amount:    plus,
-				Timeout:   333,
+		"nothing": {
+			&CreateMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 			},
-			noErr,
+			errors.ErrEmpty,
 		},
-		// missing sender okay, dups okay
-		2: {
-			&CreateEscrowMsg{
-				Arbiter:   c,
-				Recipient: c.Address(),
-				Amount:    plus,
-				Timeout:   52,
-				Memo:      "some string",
+		"happy path": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Source:      a.Address(),
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Amount:      plus,
+				Timeout:     timeout,
 			},
-			noErr,
+			nil,
 		},
-		// invalid permissions
-		3: {
-			&CreateEscrowMsg{
-				Arbiter:   d,
-				Recipient: c.Address(),
-				Amount:    plus,
-				Timeout:   52,
+		"missing source okay, dups okay": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     c.Address(),
+				Destination: c.Address(),
+				Amount:      plus,
+				Timeout:     timeout,
+				Memo:        "some string",
 			},
-			IsInvalidConditionErr,
+			nil,
 		},
-		// negative amount
-		4: {
-			&CreateEscrowMsg{
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Amount:    minus,
-				Timeout:   52,
+		"negative amount": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Amount:      minus,
+				Timeout:     timeout,
 			},
-			cash.IsInvalidAmountErr,
+			errors.ErrAmount,
 		},
-		// improperly formatted amount
-		5: {
-			&CreateEscrowMsg{
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Amount:    mixed,
-				Timeout:   52,
+		"improperly formatted amount": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Amount:      mixed,
+				Timeout:     timeout,
 			},
-			x.IsInvalidCurrencyErr,
+			errors.ErrCurrency,
 		},
-		// missing amount
-		6: {
-			&CreateEscrowMsg{
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Timeout:   52,
+		"missing amount": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Timeout:     timeout,
 			},
-			cash.IsInvalidAmountErr,
+			errors.ErrAmount,
 		},
-		// invalid memo
-		7: {
-			&CreateEscrowMsg{
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Amount:    plus,
-				Timeout:   52,
-				Memo:      strings.Repeat("foo", 100),
+		"invalid memo": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Amount:      plus,
+				Timeout:     timeout,
+				Memo:        strings.Repeat("foo", 100),
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
-		// invalid timeout
-		8: {
-			&CreateEscrowMsg{
-				Arbiter:   b,
-				Recipient: c.Address(),
-				Amount:    plus,
-				Timeout:   -8,
+		"zero timeout": {
+			&CreateMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				Arbiter:     b.Address(),
+				Destination: c.Address(),
+				Amount:      plus,
+				Timeout:     0,
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
 	}
 
-	for i, tc := range cases {
-		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			assert.Equal(t, pathCreateEscrowMsg, tc.msg.Path())
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			err := tc.msg.Validate()
-			assert.True(t, tc.check(err), "%+v", err)
+			assert.IsErr(t, tc.check, err)
 		})
 	}
 }
 
-func TestReleaseEscrowMsg(t *testing.T) {
+func TestReleaseMsg(t *testing.T) {
 	// valid: fixed 8 byte id
 	escrow := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	// invalid: other size id
 	scarecrow := []byte{1, 2, 3, 4}
 
 	// good
-	plus := mustCombineCoins(x.NewCoin(100, 0, "FOO"))
+	plus := mustCombineCoins(coin.NewCoin(100, 0, "FOO"))
 	// invalid
-	minus := mustCombineCoins(x.NewCoin(100, 0, "BAR"),
-		x.NewCoin(-20, 0, "FIT"))
-	mixed := x.Coins{{Whole: 100, Ticker: "bad"}}
+	minus := mustCombineCoins(coin.NewCoin(100, 0, "BAR"),
+		coin.NewCoin(-20, 0, "FIT"))
+	mixed := coin.Coins{{Whole: 100, Ticker: "bad"}}
 
-	cases := []struct {
-		msg   *ReleaseEscrowMsg
-		check checkErr
+	cases := map[string]struct {
+		msg   *ReleaseMsg
+		check error
 	}{
-		// nothing
-		0: {new(ReleaseEscrowMsg), IsInvalidMetadataErr},
-		// proper: valid amount
-		1: {
-			&ReleaseEscrowMsg{
+		"nothing": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+			},
+			errors.ErrInput,
+		},
+		"proper: valid amount": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 				Amount:   plus,
 			},
-			noErr,
+			nil,
 		},
-		// missing amount okay
-		2: {
-			&ReleaseEscrowMsg{
+		"missing amount okay": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 			},
-			noErr,
+			nil,
 		},
-		// invalid id
-		3: {
-			&ReleaseEscrowMsg{
+		"invalid id": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: scarecrow,
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
-		// missing id
-		4: {
-			&ReleaseEscrowMsg{
-				Amount: plus,
+		"missing id": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				Amount:   plus,
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
-		// negative amount
-		5: {
-			&ReleaseEscrowMsg{
+		"negative amount": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 				Amount:   minus,
 			},
-			cash.IsInvalidAmountErr,
+			errors.ErrAmount,
 		},
-		// improperly formatted amount
-		6: {
-			&ReleaseEscrowMsg{
+		"improperly formatted amount": {
+			&ReleaseMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 				Amount:   mixed,
 			},
-			x.IsInvalidCurrencyErr,
+			errors.ErrCurrency,
 		},
 	}
 
-	for i, tc := range cases {
-		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			assert.Equal(t, pathReleaseEscrowMsg, tc.msg.Path())
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			err := tc.msg.Validate()
-			assert.True(t, tc.check(err), "%+v", err)
+			assert.IsErr(t, tc.check, err)
 		})
 	}
 }
 
-func TestReturnEscrowMsg(t *testing.T) {
+func TestReturnMsg(t *testing.T) {
 	// valid: fixed 8 byte id
 	escrow := []byte{0xff, 0, 1, 3, 6, 6, 6, 6}
 	// invalid: other size id
 	scarecrow := []byte{1, 2, 3, 4}
 
-	cases := []struct {
-		msg   *ReturnEscrowMsg
-		check checkErr
+	cases := map[string]struct {
+		msg   *ReturnMsg
+		check error
 	}{
-		// missing id
-		0: {new(ReturnEscrowMsg), IsInvalidMetadataErr},
-		// proper: valid id
-		1: {
-			&ReturnEscrowMsg{
+		"missing id": {
+			&ReturnMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+			},
+			errors.ErrInput,
+		},
+		"proper: valid id": {
+			&ReturnMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 			},
-			noErr,
+			nil,
 		},
-		// invalid id
-		2: {
-			&ReturnEscrowMsg{
+		"invalid id": {
+			&ReturnMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: scarecrow,
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
 	}
 
-	for i, tc := range cases {
-		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			assert.Equal(t, pathReturnEscrowMsg, tc.msg.Path())
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			err := tc.msg.Validate()
-			assert.True(t, tc.check(err), "%+v", err)
+			assert.IsErr(t, tc.check, err)
 		})
 	}
 }
 
 func TestUpdateEscrowMsg(t *testing.T) {
-	var helpers x.TestHelpers
-
 	// valid: fixed 8 byte id
 	escrow := []byte{0xf, 0, 0, 0xb, 0xa, 0xd, 7, 7}
 	// invalid: other size id
 	scarecrow := []byte{1, 2, 3, 4}
 
 	// good
-	_, a := helpers.MakeKey()
-	_, b := helpers.MakeKey()
+	a := weavetest.NewCondition()
+	b := weavetest.NewCondition()
 	c := weave.NewCondition("monkey", "gelato", []byte("berry"))
-	// invalid
-	d := weave.Condition("foobar")
 
-	cases := []struct {
-		msg   *UpdateEscrowPartiesMsg
-		check checkErr
+	cases := map[string]struct {
+		msg   *UpdatePartiesMsg
+		check error
 	}{
-		// nothing
-		0: {new(UpdateEscrowPartiesMsg), IsInvalidMetadataErr},
-		// proper: valid id, one valid permission
-		1: {
-			&UpdateEscrowPartiesMsg{
-				EscrowId: escrow,
-				Sender:   a.Address(),
+		"nothing": {
+			&UpdatePartiesMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 			},
-			noErr,
+			errors.ErrInput,
 		},
-		// valid escrow, no permissions
-		2: {
-			&UpdateEscrowPartiesMsg{
+		"proper: valid id, one valid permission": {
+			&UpdatePartiesMsg{
+				Metadata: &weave.Metadata{Schema: 1},
+				EscrowId: escrow,
+				Source:   a.Address(),
+			},
+			nil,
+		},
+		"valid escrow, no permissions": {
+			&UpdatePartiesMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: escrow,
 			},
-			IsMissingConditionErr,
+			errors.ErrEmpty,
 		},
-		// invalid escrow, proper permissions
-		3: {
-			&UpdateEscrowPartiesMsg{
+		"invalid escrow, proper permissions": {
+			&UpdatePartiesMsg{
+				Metadata: &weave.Metadata{Schema: 1},
 				EscrowId: scarecrow,
-				Sender:   a.Address(),
+				Source:   a.Address(),
 			},
-			IsInvalidMetadataErr,
+			errors.ErrInput,
 		},
-		// allow multiple permissions
-		4: {
-			&UpdateEscrowPartiesMsg{
-				EscrowId:  escrow,
-				Recipient: b.Address(),
-				Arbiter:   c,
+		"allow multiple permissions": {
+			&UpdatePartiesMsg{
+				Metadata:    &weave.Metadata{Schema: 1},
+				EscrowId:    escrow,
+				Destination: b.Address(),
+				Arbiter:     c.Address(),
 			},
-			noErr,
-		},
-		// check for valid permissions
-		5: {
-			&UpdateEscrowPartiesMsg{
-				EscrowId: escrow,
-				Arbiter:  d,
-			},
-			IsInvalidConditionErr,
+			nil,
 		},
 	}
 
-	for i, tc := range cases {
-		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			assert.Equal(t, pathUpdateEscrowPartiesMsg, tc.msg.Path())
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
 			err := tc.msg.Validate()
-			assert.True(t, tc.check(err), "%+v", err)
+			assert.IsErr(t, tc.check, err)
 		})
 	}
 }
